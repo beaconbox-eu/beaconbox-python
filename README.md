@@ -80,6 +80,28 @@ if result.sms and result.sms.skipped_reason == SkipReason.INSUFFICIENT_CREDIT:
 **This SDK does not raise on a skip**, deliberately. Treating one as an error is what invites a
 retry, and a retry of a push that already succeeded is a second message to a real person.
 
+The **email** side answers the same question a step later, because that decision is made when the
+nudge runs rather than when you push:
+
+```python
+from beaconbox import EmailSkipReason
+
+message = client.messages.retrieve(result.id)
+
+if message.delivery.not_sent:
+    # No email was ever attempted, and none will be. Stop polling for delivery.
+    if message.delivery.not_sent.reason == EmailSkipReason.PLAN_LAPSED:
+        ...  # the subscription ran out; paying resumes sending
+```
+
+`not_sent` is what tells `delivery.delivered is False` apart from itself — without it that flag
+meant both *on its way* and *never attempted*, so a loop waiting for delivery had nothing to stop
+on. It is `None` in the ordinary case, and a later successful send withdraws it.
+
+Compare `reason` as a string and treat an unrecognised value as "not sent": the server's list
+grows whenever a refusal is added to the send path, which is why this field is not typed as the
+enum.
+
 ### 2. Idempotency is handled for you, and you can do better
 
 Every write carries an `Idempotency-Key`. This SDK generates one per call and **reuses it across
@@ -187,6 +209,12 @@ differently from the one you tested with. The helper also checks the timestamp (
 so a captured delivery cannot be replayed) and compares in constant time.
 
 Deliveries are **retried**, so the same `event.id` can arrive twice. Deduplicate on it.
+
+Two event types are worth wiring up before you need them. `MESSAGE_NOT_SENT` carries a `reason`
+and tells you an email was never attempted — the machine-readable half of the section above.
+`PLAN_LAPSED` means email sending has **stopped** for your account, and every nudge from then on
+produces a `MESSAGE_NOT_SENT` with reason `plan_lapsed` until the subscription is paid; it is the
+one to page on, and there is no way to learn it from your own side.
 
 ## Errors
 

@@ -38,9 +38,11 @@ __all__ = [
     "DeliveryStatus",
     "Message",
     "MessagePage",
+    "MessagePush",
     "MessagePushResult",
     "NewApiKey",
     "NewWebhookEndpoint",
+    "NotSent",
     "RecipientSms",
     "RetractResult",
     "SmsDelivery",
@@ -312,11 +314,43 @@ class SmsDelivery:
 
 
 @dataclass(frozen=True)
+class NotSent:
+    """Set when BeaconBox decided not to email a message at all, and that decision still stands.
+
+    **The field that makes ``delivered is False`` readable.** Without it that flag meant two
+    opposite things — *on its way* and *never attempted, and never will be* — so a caller polling
+    for delivery had no way to know when to stop. ``None`` is the ordinary case.
+
+    :attr:`reason` is a plain string rather than an enum, unlike :class:`SmsDelivery`'s
+    ``skipped_reason`` companion. The server's list grows whenever a refusal is added to the send
+    path, and an SDK that raised on an unrecognised value would turn a new server-side reason into
+    a client-side crash. Compare against :class:`~beaconbox.enums.EmailSkipReason` for the known
+    ones and treat anything else as "not sent".
+    """
+
+    reason: str
+    at: datetime | None = None
+    raw: Payload = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, payload: Payload) -> NotSent:
+        return cls(
+            reason=str(payload.get("reason", "")),
+            at=_parse_datetime(payload.get("at")),
+            raw=payload,
+        )
+
+
+@dataclass(frozen=True)
 class DeliveryStatus:
     """A message's delivery state, derived from its events.
 
     ``opened`` is the one worth acting on: it is the difference between "we sent it" and "they
     have it", and it is what ``escalate_if_unread_after_minutes`` waits on.
+
+    ``not_sent`` is the one worth checking *before* you wait for any of them. Non-``None`` means
+    no email was ever attempted and none will be, so polling ``delivered`` for this message will
+    never terminate. See :class:`NotSent`.
     """
 
     delivered: bool
@@ -326,11 +360,13 @@ class DeliveryStatus:
     opened_at: datetime | None = None
     bounced_at: datetime | None = None
     sms: SmsDelivery | None = None
+    not_sent: NotSent | None = None
     raw: Payload = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, payload: Payload) -> DeliveryStatus:
         sms = payload.get("sms")
+        not_sent = payload.get("not_sent")
         return cls(
             delivered=bool(payload.get("delivered", False)),
             opened=bool(payload.get("opened", False)),
@@ -339,6 +375,7 @@ class DeliveryStatus:
             opened_at=_parse_datetime(payload.get("opened_at")),
             bounced_at=_parse_datetime(payload.get("bounced_at")),
             sms=SmsDelivery.from_api(sms) if isinstance(sms, dict) else None,
+            not_sent=NotSent.from_api(not_sent) if isinstance(not_sent, dict) else None,
             raw=payload,
         )
 

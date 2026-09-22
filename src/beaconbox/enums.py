@@ -17,6 +17,7 @@ from typing import Any, TypeVar
 __all__ = [
     "Channel",
     "ChannelSendStatus",
+    "EmailSkipReason",
     "MessageKind",
     "MessageStatus",
     "RecipientStatus",
@@ -103,9 +104,14 @@ class WhatsAppReplyForward(str, Enum):
 class WebhookEventType(str, Enum):
     """What an endpoint can subscribe to.
 
-    Only outcomes the sender cannot already know. There is no ``message.created``: you just made
+    Only things the sender cannot already know. There is no ``message.created``: you just made
     that call and got the message back, so an event for it would be a round trip telling you
     nothing.
+
+    Most are delivery outcomes. The rest — ``credits.low_balance`` and the three ``plan.*`` — are
+    about the *account*, and they pass the same test for a sharper reason: nothing in a response
+    to one of your own calls would ever mention them, so without these you learn your sending has
+    stopped from a customer.
 
     An endpoint registered with an **empty** list receives every type, including types added
     after it was created. That is the recommended setting, because a narrow subscription is how a
@@ -117,6 +123,11 @@ class WebhookEventType(str, Enum):
     MESSAGE_BOUNCED = "message.bounced"
     MESSAGE_FAILED = "message.failed"
     MESSAGE_COMPLAINED = "message.complained"
+    MESSAGE_NOT_SENT = "message.not_sent"
+    """No email was ever attempted, and ``data["reason"]`` says why.
+
+    Deliberately not ``message.failed``: nothing was submitted and nothing bounced, so folding it
+    in would put a refusal into the rate you watch for provider trouble."""
     SMS_DELIVERED = "sms.delivered"
     SMS_FAILED = "sms.failed"
     SMS_REJECTED = "sms.rejected"
@@ -126,6 +137,47 @@ class WebhookEventType(str, Enum):
     WHATSAPP_READ = "whatsapp.read"
     WHATSAPP_INBOUND_MESSAGE = "whatsapp.inbound_message"
     CREDITS_LOW_BALANCE = "credits.low_balance"
+    PLAN_PAST_DUE = "plan.past_due"
+    """The card failed. Email sending stops at ``data["period_end"]``, so there is still time."""
+    PLAN_LAPSED = "plan.lapsed"
+    """**Email sending has stopped.** The one to alert on: every nudge from here produces a
+    :attr:`MESSAGE_NOT_SENT` with reason ``plan_lapsed`` until the subscription is paid."""
+    PLAN_ALLOWANCE_EXCEEDED = "plan.allowance_exceeded"
+    """The period's included email is used up. Nothing stops — it is billable from here."""
+
+
+class EmailSkipReason(str, Enum):
+    """Why a nudge email was never sent — the values ``delivery.not_sent.reason`` carries.
+
+    **Not the parsed type of that field**, deliberately: :class:`~beaconbox.models.NotSent` keeps
+    ``reason`` a plain string, because this list grows on the server whenever a refusal is added
+    to the send path and an SDK that raised on an unknown value would turn that into a
+    client-side crash. Compare against these and treat anything else as "not sent"::
+
+        if message.delivery.not_sent:
+            if message.delivery.not_sent.reason == EmailSkipReason.PLAN_LAPSED:
+                ...
+
+    The three worth branching on are :attr:`PLAN_LAPSED` (pay, and sending resumes),
+    :attr:`DAILY_CAP_REACHED` (nothing is wrong; the day's allowance ran out) and
+    :attr:`SUPPRESSED` (that address will never be emailed again for you).
+    """
+
+    PLAN_LAPSED = "plan_lapsed"
+    """The subscription no longer pays for email. Pay, and sending resumes — nothing has to be
+    re-pushed for new messages."""
+    DAILY_CAP_REACHED = "daily_cap_reached"
+    """The sending domain's daily cap. Nothing is wrong with the account, and later messages the
+    same day are refused too."""
+    SENDING_PAUSED = "sending_paused"
+    SUPPRESSED = "suppressed"
+    """This address hard-bounced or complained for you. It is never emailed for you again."""
+    PLATFORM_SUPPRESSED = "platform_suppressed"
+    """It hard-bounced for another merchant on the shared sending domain."""
+    UNSUBSCRIBED = "unsubscribed"
+    MESSAGE_RETRACTED = "message_retracted"
+    MESSAGE_OBSOLETE = "message_obsolete"
+    """A newer message replaced this one before its nudge ran."""
 
 
 class SkipReason(str, Enum):

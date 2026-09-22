@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from beaconbox import (
+    DeliveryStatus,
+    EmailSkipReason,
     MessageKind,
     MessagePush,
     MessagePushResult,
@@ -257,3 +259,57 @@ class TestSecrets:
 
         assert "theactualsecret" not in repr(endpoint)
         assert endpoint.secret == "whsec_theactualsecret"
+
+
+class TestNotSent:
+    """``delivery.not_sent`` — the field that tells a caller when to stop polling.
+
+    Before it existed, ``delivered is False`` meant both *on its way* and *never attempted, and
+    never will be*, so an integration waiting for a delivery that the server had already declined
+    to attempt waited forever.
+    """
+
+    def test_absent_is_none_rather_than_a_missing_key(self) -> None:
+        delivery = DeliveryStatus.from_api({"delivered": False, "opened": False, "bounced": False})
+        assert delivery.not_sent is None
+
+    def test_a_refusal_carries_its_reason_and_time(self) -> None:
+        delivery = DeliveryStatus.from_api(
+            {
+                "delivered": False,
+                "opened": False,
+                "bounced": False,
+                "not_sent": {"reason": "plan_lapsed", "at": "2026-09-22T10:00:00Z"},
+            }
+        )
+        assert delivery.not_sent is not None
+        assert delivery.not_sent.reason == EmailSkipReason.PLAN_LAPSED
+        assert delivery.not_sent.at == datetime(2026, 9, 22, 10, 0, tzinfo=timezone.utc)
+
+    def test_an_unknown_reason_parses_rather_than_raising(self) -> None:
+        """The load-bearing one, and why ``reason`` is a ``str`` and not the enum.
+
+        The server's list grows whenever a refusal is added to the send path. An SDK that raised
+        on a value it had not heard of would turn an additive server change into an outage in a
+        merchant's job runner — months after this SDK was last touched, and for a message it was
+        being told about precisely because something needed attention.
+        """
+        delivery = DeliveryStatus.from_api(
+            {
+                "delivered": False,
+                "opened": False,
+                "bounced": False,
+                "not_sent": {"reason": "some_future_reason", "at": None},
+            }
+        )
+        assert delivery.not_sent is not None
+        assert delivery.not_sent.reason == "some_future_reason"
+        assert delivery.not_sent.at is None
+
+    def test_the_enum_carries_the_wire_value(self) -> None:
+        # ``EmailSkipReason`` is documentation and a comparison target, never the parsed type —
+        # which is why the comparison that matters is the one in the test above, against a
+        # ``reason`` that is typed ``str``. Asserting the literal directly against the member is
+        # what mypy's ``--strict-equality`` rejects as non-overlapping, and it is right to: the
+        # member is what a caller compares *to*, not what they compare.
+        assert EmailSkipReason.DAILY_CAP_REACHED.value == "daily_cap_reached"

@@ -5,6 +5,34 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-09-22
+
+### Added
+
+- `delivery.not_sent` on a message: why no email was ever sent, and when we decided. Present only
+  when that decision stands — a later successful send withdraws it. It is what tells a
+  `delivered` of `False` apart from *never attempted, and never will be*, so a loop polling for
+  delivery now has something to stop on. `EmailSkipReason` lists the known values; `reason` stays a plain string,
+  because the server's list grows and an unknown value must not raise.
+- `message.not_sent` webhook event, carrying the same `reason`. Deliberately not folded into
+  `message.failed`: nothing was attempted and nothing bounced.
+- `plan.past_due`, `plan.lapsed` and `plan.allowance_exceeded` webhook events. The second is the
+  one to alert on — it means email sending has stopped, and every nudge from then on produces a
+  `message.not_sent` with `reason: "plan_lapsed"` until the subscription is paid.
+
+### Fixed
+
+- `MessagePush` and the two types above are listed in their own modules' `__all__`. `MessagePush`
+  had been missing since 0.1.0: it was re-exported from `beaconbox` and documented, but
+  `from beaconbox.models import *` silently omitted it. A test now pins every public type into
+  its module's `__all__` and into the package root, so this cannot recur — nothing had been
+  checking, which is why it went unnoticed through a release.
+
+### Note
+
+- `DeliveryStatus` gained a field before `raw`. It is a response model built by `from_api`, so
+  this affects only code constructing one positionally by hand.
+
 ## [0.1.0]
 
 ### Added
@@ -33,4 +61,5 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python 3.10+
 - [httpx](https://www.python-httpx.org) `>=0.28.1,<1`
 
+[0.2.0]: https://github.com/beaconbox-eu/beaconbox-python/releases/tag/v0.2.0
 [0.1.0]: https://github.com/beaconbox-eu/beaconbox-python/releases/tag/v0.1.0

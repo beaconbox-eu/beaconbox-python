@@ -13,9 +13,11 @@ version-conditional import under a ``python_version``-pinned mypy failed on 3.11
 
 from __future__ import annotations
 
+import inspect
 import re
 from importlib.metadata import metadata, requires, version
 from pathlib import Path
+from types import ModuleType
 
 import beaconbox
 from beaconbox import __version__
@@ -117,3 +119,91 @@ class TestDependencies:
         floor = metadata(_DISTRIBUTION)["Requires-Python"]
 
         assert floor and floor.startswith(">="), f"expected a floor, got {floor!r}"
+
+
+class TestPublicSurface:
+    """Every public name is re-exported and listed, in all three places that have to agree.
+
+    **Written because two names had already slipped.** `NotSent` and `EmailSkipReason` were added
+    to `models` and `enums`, re-exported from the package root, and left out of their own module's
+    `__all__` — so `from beaconbox.models import *` silently omitted one of them while
+    `from beaconbox import NotSent` worked. Nothing failed: the suite was green, mypy was clean,
+    and the only symptom would have been a consumer's star-import or a doc generator quietly
+    missing a type.
+
+    Asserted as a property of the module rather than as a list of expected names, so adding a
+    model never means editing this test — which is what a hand-maintained list would degrade into
+    ignoring.
+    """
+
+    @staticmethod
+    def _public_types(module: ModuleType) -> set[str]:
+        """Exported classes and functions defined *in* this module.
+
+        Filtered by `__module__`, or every symbol a module imports for its own use — `datetime`,
+        `Enum`, the models `enums` pulls in — would count as part of its surface and this would
+        demand they all be re-exported.
+        """
+        return {
+            name
+            for name, obj in vars(module).items()
+            if not name.startswith("_")
+            and (inspect.isclass(obj) or inspect.isfunction(obj))
+            and getattr(obj, "__module__", None) == module.__name__
+        }
+
+    def test_every_model_is_in_its_own_dunder_all(self) -> None:
+        from beaconbox import models
+
+        missing = self._public_types(models) - set(models.__all__)
+
+        assert not missing, (
+            f"defined in beaconbox.models but absent from its __all__: {sorted(missing)}"
+        )
+
+    def test_every_enum_is_in_its_own_dunder_all(self) -> None:
+        from beaconbox import enums
+
+        missing = self._public_types(enums) - set(enums.__all__)
+
+        assert not missing, (
+            f"defined in beaconbox.enums but absent from its __all__: {sorted(missing)}"
+        )
+
+    def test_the_package_root_re_exports_every_model_and_enum_type(self) -> None:
+        """The root is the import path the README documents, so a type reachable only via
+        `beaconbox.models` is one a reader has no reason to believe exists.
+
+        **Types, not every exported name.** `enums.coerce` is a helper the models call and the
+        module docstring points at; it is deliberately not part of the root surface, and widening
+        this to cover it would either force a meaningless re-export or invite the whole assertion
+        to be deleted the next time it fired.
+        """
+        from beaconbox import enums, models
+
+        expected = {
+            name
+            for module in (models, enums)
+            for name in module.__all__
+            if inspect.isclass(getattr(module, name))
+        }
+        missing = expected - set(beaconbox.__all__)
+
+        assert not missing, f"not re-exported from `beaconbox`: {sorted(missing)}"
+
+    def test_everything_listed_at_the_root_actually_imports(self) -> None:
+        """The other direction: a name left in `__all__` after a rename makes
+        `from beaconbox import *` raise, which no other test here would reach."""
+        missing = [name for name in beaconbox.__all__ if not hasattr(beaconbox, name)]
+
+        assert not missing, f"listed in beaconbox.__all__ but not importable: {missing}"
+
+    def test_dunder_all_is_sorted_and_free_of_duplicates(self) -> None:
+        """Every `__all__` in this package is kept sorted, which is the only thing that makes a
+        one-line addition to one of them reviewable as a one-line diff."""
+        from beaconbox import enums, models
+
+        for module in (beaconbox, models, enums):
+            names = list(module.__all__)
+            assert names == sorted(names), f"{module.__name__}.__all__ is not sorted"
+            assert len(names) == len(set(names)), f"{module.__name__}.__all__ has duplicates"
