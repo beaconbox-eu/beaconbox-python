@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# A lock file is for an application, not a library. This package is installed *next to* a
+# consumer's own dependencies and resolved against them, so a lock committed here pins nothing
+# for anybody who installs it — and hatchling puts it in the sdist, where it is noise. The PHP
+# SDK gitignores composer.lock for the same reason.
+#
+# `uv run` writes one as a side effect, so this line is what keeps it from being committed by
+# accident rather than on purpose. Tracking lock files for the SDKs would be a deliberate
+# decision for both of them, not one that arrives with a stray command.
+uv.lock

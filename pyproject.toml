@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/beaconbox/_version.py"
+
+[project]
+name = "beaconbox"
+# Read from src/beaconbox/_version.py by [tool.hatch.version] above, so the number on PyPI and
+# the number the client reports in its User-Agent are the same value rather than two that have
+# to be kept in step.
+dynamic = ["version"]
+description = "Official Python SDK for BeaconBox, order updates your customers actually receive."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "BeaconBox", email = "sdk@beaconbox.eu" }]
+keywords = ["beaconbox", "notifications", "transactional", "sms", "whatsapp", "eu"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+# One runtime dependency, and it is the only library where the sync and the async client share
+# an API, so this SDK's core logic is written once rather than twice.
+#
+# The upper bound is `<1` rather than `<0.29` on purpose. A library that pins a narrow range is
+# a library that cannot be installed next to another one, and httpx is common enough in a web
+# application that a tight pin would make BeaconBox the reason somebody's resolver fails.
+dependencies = ["httpx>=0.28.1,<1"]
+
+[project.urls]
+Homepage = "https://beaconbox.eu"
+Documentation = "https://docs.beaconbox.eu"
+Source = "https://github.com/beaconbox-eu/beaconbox-python"
+Issues = "https://github.com/beaconbox-eu/beaconbox-python/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "mypy>=1.13",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/beaconbox"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# The live suite talks to a real BeaconBox over the network. It is opt-in via BEACONBOX_LIVE_URL
+# so that `pytest` with no setup stays hermetic and fast.
+markers = ["live: runs against a real BeaconBox instance (see tests/live/README.md)"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src", "tests"]

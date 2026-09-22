@@ -1,0 +1,45 @@
+name: CI
+
+# Unit tests only. The live suite is gated on BEACONBOX_LIVE_URL and skips itself here: it needs
+# a running BeaconBox, which is exercised in the private platform repository before a release is
+# cut.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # The versions pyproject.toml declares support for. 3.10 is the floor and is listed first
+      # because it is the one that breaks: it is where `tomllib` is absent and where a 3.11+ only
+      # syntax would surface.
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+
+      - name: Sync deps
+        run: uv sync --all-extras --dev
+
+      - name: Ruff
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy
+
+      - name: Pytest
+        run: uv run pytest -q

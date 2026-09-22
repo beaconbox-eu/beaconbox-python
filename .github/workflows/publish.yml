@@ -1,0 +1,100 @@
+name: Publish to PyPI
+
+# Pushing a tag `vX.Y.Z` to this repository is what publishes a release.
+#
+# The distribution is `beaconbox`; the import name is `beaconbox` too.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    name: Build + publish
+    runs-on: ubuntu-latest
+    permissions:
+      # PyPI trusted publishing (OIDC). No API token is stored anywhere: PyPI is configured to
+      # trust this workflow, in this repository, and mints a short-lived credential per run.
+      #
+      # For the FIRST release the project does not exist on PyPI yet, so there is nothing to
+      # attach a publisher to — configure a *pending* publisher first at
+      # https://pypi.org/manage/account/publishing/. Its **PyPI project name is the distribution
+      # name, `beaconbox`** — not `beaconbox-python`, which is this repository. Getting that wrong
+      # fails the upload with "invalid-publisher" *after* the tag is public, because PyPI looks
+      # for a publisher for the project being uploaded and finds none.
+      id-token: write
+      # Spelling `permissions` at all drops every default to `none`, so checkout's read has to be
+      # asked for back.
+      contents: read
+
+    # **Deliberately no `environment:`.** An environment is worth adding for a publish job — it is
+    # where a required reviewer would go — but it has to be added on both sides at once: PyPI
+    # matches the publisher on (project, repository, workflow, environment), so naming one here
+    # while the publisher says "(Any)" is a second thing to keep in step for no gain today.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      # The version is declared once, in `_version.py`, and `pyproject.toml` reads it through
+      # hatchling's `dynamic = ["version"]`. So this reads the module, NOT `project.version` —
+      # that key does not exist in this project and looking it up raises rather than comparing.
+      #
+      # The tag is checked against it because a tag is the only part of a release nobody
+      # validates by running it: the wheel would build and upload happily under a number that
+      # disagrees with what the client reports in its User-Agent.
+      - name: Verify the tag matches the package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/beaconbox/_version.py)"
+          if [ -z "$PKG_VERSION" ]; then
+            echo "::error::could not read __version__ from src/beaconbox/_version.py"
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag $TAG_VERSION does not match __version__ $PKG_VERSION"
+            exit 1
+          fi
+          echo "publishing $PKG_VERSION"
+
+      - name: Sync deps
+        run: uv sync --all-extras --dev
+
+      # The gate runs here and not only on the pushing side, because this is the tree that gets
+      # uploaded. A tag can be pushed at any commit by anyone with write access.
+      - name: Test
+        run: uv run pytest -q
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Types
+        run: uv run mypy
+
+      - name: Build
+        run: uv build
+
+      # `py.typed` reaching the wheel is the one packaging property that fails silently in a
+      # consumer's project: PEP 561 makes a type checker ignore every annotation in a package
+      # without it, with no error anywhere.
+      - name: Check the artefact
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          if not any(n.endswith("beaconbox/py.typed") for n in names):
+              sys.exit(f"{wheel} ships no py.typed")
+          if any(n.startswith("tests/") for n in names):
+              sys.exit(f"{wheel} ships the test suite")
+          print(f"{wheel}: ok")
+          PY
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
