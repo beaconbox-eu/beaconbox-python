@@ -36,6 +36,61 @@ __all__ = ["Credits", "Keys", "Messages", "Recipients", "WebhookEndpoints"]
 DEFAULT_PAGE_SIZE = 50
 
 
+class _PageWalk:
+    """Guards a cursor walk against a server that never finishes it.
+
+    Shared by the sync and the async ``iterate``, which is the point: the rule and the sentence
+    that explains it were written out twice, once per generator, and a safety check duplicated is
+    a safety check that gets improved in one copy.
+
+    A repeated cursor is a server bug. What makes it worth a client-side check is the shape it
+    takes in a merchant's process — a worker that never returns and a generator that never ends,
+    which is far harder to diagnose than an exception.
+
+    Private, and imported across modules the way :func:`_value` is. A caller has no reason to
+    construct one, and a name in ``resources.__all__`` that the package root does not re-export
+    would be public surface nobody documents.
+    """
+
+    __slots__ = ("_seen",)
+
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+
+    def advance(self, cursor: str | None) -> str | None:
+        """The cursor to request next, or ``None`` when the walk is over.
+
+        Not called ``next``: this is not an iterator, and a method of that name on an object handed
+        to a ``while`` loop invites a reader to assume it is one.
+
+        :raises BeaconBoxError: if ``cursor`` has been handed out before.
+        """
+        if not cursor:
+            return None
+        if cursor in self._seen:
+            raise BeaconBoxError(
+                f"BeaconBox: pagination did not advance (cursor {cursor!r} repeated). "
+                "Stopping rather than looping forever."
+            )
+        self._seen.add(cursor)
+        return cursor
+
+
+def _check_page_size(page_size: int) -> None:
+    """Reject a page size that cannot mean what the caller intended.
+
+    The server clamps ``limit`` into its own range, so ``page_size=0`` is not an error there — it
+    quietly becomes one message per request, and a merchant walking a year of history discovers
+    that as a job that takes hours rather than as a mistake in their call.
+
+    Both callers are generators, so this runs on the first ``next()`` rather than at the call that
+    built them. That is ordinary generator behaviour and the tests pin it: nothing reaches the
+    network first.
+    """
+    if page_size < 1:
+        raise ValueError(f"BeaconBox: page_size must be at least 1, got {page_size}")
+
+
 class _Resource:
     def __init__(self, transport: SyncTransport) -> None:
         self._transport = transport
@@ -112,6 +167,12 @@ class Messages(_Resource):
             ``"checkout tickbox"``. This is the audit answer to "prove they agreed", so it must
             name a real surface of yours. Recording consent is not sending, so it works while your
             WhatsApp channel is still off. Consent is per business and reaches no other merchant.
+        :param sms_if_whatsapp_fails: Text this recipient if the WhatsApp nudge proves
+            *undeliverable* — Meta refuses it (usually because the number is not on WhatsApp), the
+            delivery status comes back failed, or no status arrives within five minutes. It does
+            **not** fire for a message that was delivered and not read: someone who read it on
+            another device would get the same update twice. The SMS costs its own credit and
+            appears as its own send. Ignored unless a WhatsApp message was actually queued.
         :param idempotency_key: See below. Generated when omitted.
 
         **Idempotency.** Every write carries an ``Idempotency-Key``. This SDK generates one per
@@ -224,20 +285,15 @@ class Messages(_Resource):
         merchant's process is a worker that never returns and a generator that never ends, which
         is far harder to diagnose than the exception raised here.
         """
+        _check_page_size(page_size)
+        walk = _PageWalk()
         cursor: str | None = None
-        seen: set[str] = set()
         while True:
             page = self.list(recipient_email, page_size, cursor)
             yield from page.items
-            cursor = page.next_cursor
-            if not cursor:
+            cursor = walk.advance(page.next_cursor)
+            if cursor is None:
                 return
-            if cursor in seen:
-                raise BeaconBoxError(
-                    f"BeaconBox: pagination did not advance (cursor {cursor!r} repeated). "
-                    "Stopping rather than looping forever."
-                )
-            seen.add(cursor)
 
     def resend_sms(self, public_id: str, idempotency_key: str | None = None) -> SmsOutcome:
         """Send the SMS for a message whose text never went out.
@@ -391,7 +447,7 @@ class WebhookEndpoints(_Resource):
         an integration by.
         """
         return self._transport.invoke(
-            _ops.create_webhook_endpoint(url, [str(_value(t)) for t in event_types], description),
+            _ops.create_webhook_endpoint(url, [_value(t) for t in event_types], description),
             idempotency_key,
         )
 

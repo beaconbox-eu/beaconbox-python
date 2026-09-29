@@ -16,6 +16,7 @@ from beaconbox._core import (
     path_segment,
     retry_after_seconds,
 )
+from beaconbox._version import __version__
 from beaconbox.errors import (
     AuthenticationError,
     ConflictError,
@@ -114,10 +115,111 @@ class TestBaseUrl:
         with pytest.raises(ValueError):
             core(url)
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://api.beaconbox.test?x=1",
+            "https://api.beaconbox.test/#frag",
+            "https://api.beaconbox.test/v2?token=abc",
+            # A bare delimiter with nothing after it. `urlsplit` reports these as the empty
+            # string, which is falsy, so a check on `parts.query`/`parts.fragment` waved them
+            # through — and they break the URL in exactly the same way.
+            "https://api.beaconbox.test?",
+            "https://api.beaconbox.test#",
+            "https://api.beaconbox.test/?",
+            "https://api.beaconbox.test/#",
+        ],
+    )
+    def test_a_base_url_with_a_query_or_fragment_is_refused(self, url: str) -> None:
+        """It would not fail, it would go somewhere else.
+
+        ``prepare`` appends ``/api/v1/...`` and then its own ``?``, so
+        ``https://host?x=1`` silently became ``https://host?x=1/api/v1/credits`` — the whole API
+        path swallowed into a query value, against an endpoint nobody chose.
+        """
+        with pytest.raises(ValueError, match="query string or fragment"):
+            core(url)
+
+    def test_a_base_url_may_carry_a_path_prefix(self) -> None:
+        """A gateway that mounts BeaconBox under a prefix is a real deployment, unlike a query."""
+        prepared = core("https://gateway.test/beaconbox").prepare(Call("GET", "/credits", noop))
+
+        assert prepared.url == "https://gateway.test/beaconbox/api/v1/credits"
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "bbx\r\nX-Injected: 1",
+            "bbx_live\nAuthorization: Bearer other",
+            "bbx_live_\x00abc",
+            "bbx_live_a\tb",
+            "bbx_live_caf\u00e9",
+        ],
+    )
+    def test_an_api_key_that_cannot_go_in_a_header_is_refused(self, key: str) -> None:
+        """A ``\r\n`` in the key is request smuggling with the caller's own credential.
+
+        The common cause is innocent — a key read from a file keeps its trailing newline, or a
+        word processor substituted a quote mark — and the outcome without this check is either a
+        forged request line or an encoding error thrown from inside httpx at the first call, with
+        nothing naming the actual problem.
+        """
+        with pytest.raises(ValueError, match="cannot go in an HTTP header"):
+            Core(key)
+
+    def test_the_refusal_never_quotes_the_key(self) -> None:
+        """This message reaches a log. The key it is complaining about must not."""
+        with pytest.raises(ValueError) as caught:
+            Core("bbx_live_secretvalue\r\nX-Injected: 1")
+
+        assert "secretvalue" not in str(caught.value)
+
+    def test_surrounding_whitespace_is_still_forgiven(self) -> None:
+        """Stripped, not refused: a key pasted with a trailing newline is the normal case."""
+        assert (
+            Core(" bbx_live_abc\n").prepare(Call("GET", "/credits", noop)).headers["Authorization"]
+            == "Bearer bbx_live_abc"
+        )
+
     def test_an_empty_api_key_is_refused_at_construction(self) -> None:
         """Not at the first request, where it would surface as a confusing 401."""
         with pytest.raises(ValueError, match="API key is required"):
             Core("   ")
+
+
+class TestUserAgentSuffix:
+    """The suffix is a label a human reads, so it is sanitised rather than refused.
+
+    **It used to reach the header verbatim.** httpx keeps the value as given and h11 then refuses to
+    serialise the request, raising `httpx.LocalProtocolError` — an `httpx.HTTPError`, which the
+    transport catches and *retries*. So a `\r\n` in a caller's own configuration spent the whole
+    retry budget and then reported "the request did not complete: retry with the same idempotency
+    key".
+    """
+
+    @pytest.mark.parametrize(
+        ("suffix", "expected"),
+        [
+            ("acme-shop/2.1", "acme-shop/2.1"),
+            ("acme\r\nX-Injected: 1", "acme X-Injected: 1"),
+            ("a\tb", "a b"),
+            ("  padded  ", "padded"),
+            ("caf\u00e9", "caf"),
+        ],
+    )
+    def test_a_suffix_is_made_header_safe(self, suffix: str, expected: str) -> None:
+        agent = Core("bbx_live_abc", user_agent_suffix=suffix).user_agent
+
+        assert agent == f"beaconbox-python/{__version__} {expected}"
+        assert "\r" not in agent and "\n" not in agent
+        assert agent.isascii() and agent.isprintable()
+
+    @pytest.mark.parametrize("suffix", [None, "", "   ", "\r\n"])
+    def test_an_empty_suffix_leaves_no_trailing_space(self, suffix: str | None) -> None:
+        """A dangling space would be a User-Agent that differs from the default for no reason."""
+        assert Core("bbx_live_abc", user_agent_suffix=suffix).user_agent == (
+            f"beaconbox-python/{__version__}"
+        )
 
 
 class TestPathSegment:

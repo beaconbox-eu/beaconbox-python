@@ -98,6 +98,36 @@ class TestRejects:
         with pytest.raises(WebhookVerificationError):
             webhooks.verify(BODY, header, SECRET, now=NOW)
 
+    @pytest.mark.parametrize(
+        "signature",
+        [
+            "\u00e9",  # a single non-ASCII character
+            "caf\u00e9" * 16,  # non-ASCII at hex-digest length
+            "\u0161" + "a" * 63,  # non-ASCII in the first position
+            "zz" * 32,  # ASCII, right length, not hex
+            "abc",  # an odd number of hex digits
+            "a" * 4096,  # absurdly long
+        ],
+    )
+    def test_a_hostile_signature_value_is_a_verification_error(self, signature: str) -> None:
+        """Not a ``TypeError``, which is what ``hmac.compare_digest`` raises on a non-ASCII ``str``.
+
+        Anyone on the internet can POST to a merchant's webhook route, so every one of these is
+        reachable by an unauthenticated caller. The documented handler catches
+        ``WebhookVerificationError`` and answers 400; a ``TypeError`` escaping this function made
+        that a 500 with a stack trace instead, on input an attacker chooses.
+        """
+        header = f"t={NOW},v1={signature}"
+
+        with pytest.raises(WebhookVerificationError, match="does not match"):
+            webhooks.verify(BODY, header, SECRET, now=NOW)
+
+    def test_an_uppercase_hex_signature_still_verifies(self) -> None:
+        """Hex is hex. Rejecting the case a sender happened to choose would be a false negative."""
+        header = sign().upper().replace("T=", "t=").replace("V1=", "v1=")
+
+        assert webhooks.verify(BODY, header, SECRET, now=NOW).id == "evt_1"
+
     def test_a_body_that_is_not_json(self) -> None:
         body = b"not json at all"
 

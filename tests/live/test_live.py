@@ -13,21 +13,28 @@ accepted the request and the SDK understood the answer.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import TypeVar
 
 import pytest
 
 from beaconbox import (
     AsyncBeaconBox,
     BeaconBox,
+    ChannelSendStatus,
     ConflictError,
+    EmailSkipReason,
     MessageKind,
     MessagePush,
     MessageStatus,
     ResourceMissingError,
 )
+
+T = TypeVar("T")
 
 pytestmark = pytest.mark.live
 
@@ -57,11 +64,49 @@ def unique(prefix: str) -> str:
     return f"{prefix} {uuid.uuid4().hex[:8]}"
 
 
+#: Phone number for the SMS tests. In the E.164 range reserved for documentation.
+PHONE = "+37255550134"
+
+
+def eventually(read: Callable[[], T | None], *, what: str, seconds: float = 20.0) -> T:
+    """Poll ``read`` until it returns something, or fail naming what never arrived.
+
+    Delivery is asynchronous: the push returns once the send is *queued*, and the worker fills in
+    the rest. A fixed sleep would be either flaky or slow, and an unlabelled timeout would fail as
+    ``assert None is not None``.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        value = read()
+        if value is not None:
+            return value
+        if time.monotonic() >= deadline:
+            pytest.fail(f"{what} did not arrive within {seconds:g}s")
+        time.sleep(0.25)
+
+
 @pytest.fixture(scope="module")
 def client() -> Iterator[BeaconBox]:
     assert BASE_URL and API_KEY
     with BeaconBox(API_KEY, base_url=BASE_URL, verify=VERIFY) as bound:
         yield bound
+
+
+@pytest.fixture(scope="module")
+def sendable(client: BeaconBox) -> BeaconBox:
+    """The same client, once there is a balance to spend.
+
+    A zero-balance world refuses every paid send with ``insufficient_credit``, which is a correct
+    answer and a useless fixture: ``delivery.sms`` stays null and the SDK's ``SmsDelivery`` parsing
+    is exercised by nothing real. Seed with credits (``mise run //sdk:live`` does) rather than
+    letting these tests assert the refusal and look like they covered the send.
+    """
+    if client.credits.balance().balance < 1:
+        pytest.skip(
+            "needs a credit balance: seed with `beaconbox e2e seed --credits 200`, "
+            "or run `mise run //sdk:live` which does"
+        )
+    return client
 
 
 class TestMessages:
@@ -160,6 +205,68 @@ class TestMessages:
         # Idempotent: the second call reports that it changed nothing, and does not fail.
         assert client.messages.retract(pushed.id).retracted is False
 
+    def test_a_paid_sms_send_reports_its_delivery(self, sendable: BeaconBox) -> None:
+        """The paid channel actually sending, which every other test here leaves untouched.
+
+        Without a balance this whole path answers ``insufficient_credit``, so until the seed could
+        grant credits the SDK's ``SmsDelivery`` model was parsed by unit tests only — against
+        payloads this repository wrote. This is the one assertion that the real server's delivery
+        block and the SDK's reading of it agree.
+
+        ``accepted`` rather than ``delivered``: the local carrier is ``console``, which logs the
+        message and never posts a status back, so a send legitimately stops there.
+        """
+        before = sendable.credits.balance().balance
+        pushed = sendable.messages.push(
+            recipient_email=RECIPIENT,
+            subject=unique("live sms"),
+            body="Tracking XY123456789EE.",
+            recipient_phone=PHONE,
+            channels=["sms"],
+        )
+
+        assert pushed.sms is not None
+        assert pushed.sms.queued, f"not queued: {pushed.sms.skipped_reason}"
+        assert pushed.sms.credits >= 1
+
+        delivery = eventually(
+            lambda: (
+                sms
+                if (sms := sendable.messages.get(pushed.id).delivery.sms) is not None
+                and sms.submitted_at is not None
+                else None
+            ),
+            what="the SMS delivery record",
+        )
+
+        assert delivery.status in {ChannelSendStatus.ACCEPTED, ChannelSendStatus.DELIVERED}
+        assert delivery.credits_charged >= 1
+        assert delivery.submitted_at is not None
+        assert delivery.submitted_at.tzinfo is not None, "timestamps are timezone-aware"
+        assert delivery.skipped_reason is None
+        assert sendable.credits.balance().balance < before, "a real send spends a real credit"
+
+    def test_a_retraction_reports_why_no_email_was_sent(self, client: BeaconBox) -> None:
+        """``delivery.not_sent``, the field that tells ``delivered is False`` apart from *never
+        attempted, and never will be*.
+
+        Reached by retracting before the nudge runs, which is the cheapest of its reasons to
+        provoke: the others need a lapsed plan, a daily cap or a suppressed address.
+        """
+        pushed = client.messages.push(
+            recipient_email=RECIPIENT, subject=unique("live notsent"), body="b"
+        )
+        assert client.messages.retract(pushed.id).retracted
+
+        not_sent = eventually(
+            lambda: client.messages.get(pushed.id).delivery.not_sent,
+            what="the not_sent block",
+        )
+
+        assert not_sent.reason == EmailSkipReason.MESSAGE_RETRACTED
+        assert not_sent.at is not None
+        assert not_sent.at.tzinfo is not None
+
     def test_an_unknown_id_is_a_404(self, client: BeaconBox) -> None:
         with pytest.raises(ResourceMissingError):
             client.messages.get("m_definitelynotreal")
@@ -186,15 +293,38 @@ class TestOtherResources:
     def test_keys_create_list_revoke(self, client: BeaconBox) -> None:
         created = client.keys.create(f"sdk-live-{uuid.uuid4().hex[:6]}")
         assert created.key.startswith("bbx_live_")
+        assert created.id, "the create response carries the id to revoke by"
 
         try:
             listed = client.keys.list()
-            assert any(key.name == created.name for key in listed)
+            assert created.id in {key.id for key in listed}
         finally:
-            # Find our row by name: create returns the secret, list returns the id.
-            match = next((k for k in client.keys.list() if k.name == created.name), None)
-            if match is not None:
-                client.keys.revoke(match.id)
+            # Straight by id. This used to look the row up by name, which is ambiguous: a name has
+            # no unique constraint and defaults to "Untitled key", so the match could revoke a
+            # different key than the one just minted.
+            client.keys.revoke(created.id)
+
+    def test_two_unnamed_keys_are_told_apart_by_id(self, client: BeaconBox) -> None:
+        """The reason ``create`` returns an id, against the real server.
+
+        Both keys are ``"Untitled key"``, so anything matching on name cannot say which is which —
+        and this is the path a merchant takes to revoke a leaked credential.
+        """
+        first = client.keys.create()
+        second = client.keys.create()
+
+        try:
+            assert first.name == second.name
+            assert first.id != second.id
+
+            client.keys.revoke(second.id)
+            remaining = {k.id for k in client.keys.list()}
+            assert first.id in remaining
+            assert second.id not in remaining
+        finally:
+            for key in (first, second):
+                with contextlib.suppress(ResourceMissingError):
+                    client.keys.revoke(key.id)  # the second is already revoked above
 
     def test_a_minted_key_actually_works(self, client: BeaconBox) -> None:
         """End to end on the credential itself, which no unit test can reach."""
@@ -205,9 +335,7 @@ class TestOtherResources:
             with BeaconBox(created.key, base_url=BASE_URL, verify=VERIFY) as minted:
                 assert isinstance(minted.credits.balance().balance, int)
         finally:
-            match = next((k for k in client.keys.list() if k.name == created.name), None)
-            if match is not None:
-                client.keys.revoke(match.id)
+            client.keys.revoke(created.id)
 
     def test_webhook_endpoints(self, client: BeaconBox) -> None:
         url = f"https://example.com/hooks/{uuid.uuid4().hex[:8]}"

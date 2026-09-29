@@ -19,7 +19,6 @@ from datetime import datetime
 from . import _ops
 from ._transport import AsyncTransport
 from .enums import Channel, MessageKind, WebhookEventType
-from .errors import BeaconBoxError
 from .models import (
     ApiKey,
     BatchResult,
@@ -37,7 +36,7 @@ from .models import (
     WhatsAppErasureReceipt,
     WhatsAppOutcome,
 )
-from .resources import DEFAULT_PAGE_SIZE, _value
+from .resources import DEFAULT_PAGE_SIZE, _check_page_size, _PageWalk, _value
 
 __all__ = [
     "AsyncCredits",
@@ -140,21 +139,16 @@ class AsyncMessages(_AsyncResource):
         Stops if the server ever hands back a cursor it has already given. See
         :meth:`beaconbox.resources.Messages.iterate`.
         """
+        _check_page_size(page_size)
+        walk = _PageWalk()
         cursor: str | None = None
-        seen: set[str] = set()
         while True:
             page = await self.list(recipient_email, page_size, cursor)
             for item in page.items:
                 yield item
-            cursor = page.next_cursor
-            if not cursor:
+            cursor = walk.advance(page.next_cursor)
+            if cursor is None:
                 return
-            if cursor in seen:
-                raise BeaconBoxError(
-                    f"BeaconBox: pagination did not advance (cursor {cursor!r} repeated). "
-                    "Stopping rather than looping forever."
-                )
-            seen.add(cursor)
 
     async def resend_sms(self, public_id: str, idempotency_key: str | None = None) -> SmsOutcome:
         """Send the SMS for a message whose text never went out. Conflicts if one already went."""
@@ -248,7 +242,7 @@ class AsyncWebhookEndpoints(_AsyncResource):
         Leave ``event_types`` empty to receive everything, including types added later.
         """
         return await self._transport.invoke(
-            _ops.create_webhook_endpoint(url, [str(_value(t)) for t in event_types], description),
+            _ops.create_webhook_endpoint(url, [_value(t) for t in event_types], description),
             idempotency_key,
         )
 

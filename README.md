@@ -313,8 +313,17 @@ remembered to hide and the field added next year is not on it.
   your API key on the wire in clear.
 - **Redirects are never followed.** httpx would re-send the `Authorization` header to wherever a
   redirect points.
-- The key is never in a `repr`, and `NewApiKey.__repr__` redacts the minted key.
-- Webhook signatures are compared in constant time, over a signed timestamp.
+- **An API key that cannot go in a header is refused at construction** — a control character, a
+  newline or a non-ASCII character. A `\r\n` inside the key would reach the `Authorization`
+  header. Surrounding whitespace is stripped, because a key read from a file keeps its trailing
+  newline.
+- **A `base_url` with a query string or a fragment is refused**, because it would not fail, it would
+  go somewhere else. A path prefix is fine, for a gateway that mounts BeaconBox under one.
+- The key is never in a `repr`, and `NewApiKey.__repr__` redacts the minted key. Note that
+  `dataclasses.asdict` and `.raw` still carry it: read the attribute, store it, drop the object.
+- Webhook signatures are compared in constant time, over a signed timestamp, and a malformed or
+  hostile signature value is a `WebhookVerificationError` rather than an unhandled exception — so
+  the documented `except WebhookVerificationError` really does answer 400 to everything.
 
 Need a corporate CA bundle? Pass `verify=` a path or an `ssl.SSLContext`. Need a proxy or custom
 instrumentation? Pass your own `http_client=httpx.Client(...)`, and then you own closing it.
@@ -326,10 +335,10 @@ discovers during an incident that the timeout they set was never applied.
 ## Development
 
 ```bash
-uv venv && uv pip install -e '.[dev]'
-pytest            # hermetic, no network
-mypy src tests
-ruff check .
+uv sync --dev     # `-e '.[dev]'` installs nothing: dev lives in [dependency-groups], not an extra
+uv run pytest     # hermetic, no network
+uv run mypy src tests
+uv run ruff check .
 ```
 
 The live suite runs against a real BeaconBox. See [`tests/live/README.md`](tests/live/README.md).

@@ -207,3 +207,90 @@ class TestPublicSurface:
             names = list(module.__all__)
             assert names == sorted(names), f"{module.__name__}.__all__ is not sorted"
             assert len(names) == len(set(names)), f"{module.__name__}.__all__ has duplicates"
+
+
+class TestDocumentedSignatures:
+    """Two promises the prose makes that nothing was checking.
+
+    Both fail the same quiet way: a rename lands, the suite stays green, and the docstring or the
+    async client starts describing a method that no longer looks like that. A reader trusts the
+    docstring over the signature, which is what makes the drift expensive rather than cosmetic.
+    """
+
+    #: Every resource pair, sync class against its awaited twin.
+    PAIRS = (
+        ("Messages", "AsyncMessages"),
+        ("Credits", "AsyncCredits"),
+        ("Recipients", "AsyncRecipients"),
+        ("Keys", "AsyncKeys"),
+        ("WebhookEndpoints", "AsyncWebhookEndpoints"),
+    )
+
+    @staticmethod
+    def _operations(cls: type) -> dict[str, inspect.Signature]:
+        return {
+            name: inspect.signature(member)
+            for name, member in vars(cls).items()
+            if not name.startswith("_") and inspect.isfunction(member)
+        }
+
+    def test_every_documented_parameter_exists(self) -> None:
+        """A `:param x:` naming a parameter that was renamed is documentation for a call that
+        raises `TypeError`."""
+        from beaconbox import async_resources, resources
+
+        problems = []
+        for module in (resources, async_resources):
+            for cls_name in [n for pair in self.PAIRS for n in pair]:
+                cls = getattr(module, cls_name, None)
+                if cls is None:
+                    continue
+                for name, signature in self._operations(cls).items():
+                    doc = inspect.getdoc(getattr(cls, name)) or ""
+                    documented = set(re.findall(r":param (\w+):", doc))
+                    unknown = documented - set(signature.parameters)
+                    if unknown:
+                        problems.append(f"{cls.__name__}.{name} documents {sorted(unknown)}")
+
+        assert not problems, "documented parameters that do not exist: " + "; ".join(problems)
+
+    def test_push_documents_its_parameters_in_signature_order(self) -> None:
+        """`push` is the one method with a list long enough for a reader to scan rather than read,
+        and `sms_if_whatsapp_fails` had been missing from it entirely."""
+        from beaconbox.resources import Messages
+
+        doc = inspect.getdoc(Messages.push) or ""
+        documented = re.findall(r":param (\w+):", doc)
+        parameters = [p for p in inspect.signature(Messages.push).parameters if p != "self"]
+
+        assert documented == parameters
+
+    def test_the_async_client_has_the_same_signatures(self) -> None:
+        """The package docstring says "identical signatures" and the async module says "The
+        signatures match exactly". Nothing was holding them to it, and a parameter added to one
+        client and not the other is the shape that claim fails in."""
+        from beaconbox import async_resources, resources
+
+        problems = []
+        for sync_name, async_name in self.PAIRS:
+            sync_ops = self._operations(getattr(resources, sync_name))
+            async_ops = self._operations(getattr(async_resources, async_name))
+
+            if sync_ops.keys() != async_ops.keys():
+                problems.append(
+                    f"{sync_name}/{async_name} differ in operations: "
+                    f"{sorted(sync_ops.keys() ^ async_ops.keys())}"
+                )
+                continue
+            for name, sync_signature in sync_ops.items():
+                sync_params = list(sync_signature.parameters.items())
+                async_params = list(async_ops[name].parameters.items())
+                if [(n, p.kind, p.default) for n, p in sync_params] != [
+                    (n, p.kind, p.default) for n, p in async_params
+                ]:
+                    problems.append(
+                        f"{sync_name}.{name}{sync_signature} != {async_name}.{name}"
+                        f"{async_ops[name]}"
+                    )
+
+        assert not problems, "sync and async clients have drifted: " + "; ".join(problems)

@@ -57,6 +57,66 @@ __all__ = [
 Payload = dict[str, Any]
 
 
+def _text(value: Any, default: str = "") -> str:
+    """A string field, or ``default`` when the API sent something else.
+
+    ``str(value)`` was here and was wrong in the one case that matters: a field the API declares
+    required arriving as JSON ``null`` produced the four-character string ``"None"``, so
+    ``message.id`` could come back as ``"None"`` and be passed happily to the next call. A default
+    that is obviously empty is a value a caller can test; a default that is a plausible-looking
+    string is one they cannot.
+    """
+    return value if isinstance(value, str) else default
+
+
+def _opt_text(value: Any) -> str | None:
+    """An optional string field. Anything that is not a string reads as absent.
+
+    The annotation on every field built through this says ``str | None``, and a bare
+    ``payload.get()`` made that a promise the parser did not keep: a numeric ``skipped_reason``
+    would have been handed to a caller who then compared it against
+    :class:`~beaconbox.enums.SkipReason` and silently matched nothing.
+    """
+    return value if isinstance(value, str) else None
+
+
+def _flag(value: Any, default: bool = False) -> bool:
+    """A boolean field, or ``default`` when the API sent something else.
+
+    ``bool(value)`` was here, which is Python's truthiness rather than the API's answer: a
+    ``"queued": "yes"`` from a rewriting proxy read as ``True`` while the PHP SDK, whose parser
+    tests ``is_bool``, read the same payload as ``False``. The README promises the two SDKs agree,
+    and a caller comparing notes across a Python worker and a PHP worker would have found they did
+    not, on whether a message had been sent.
+
+    Strict is the safer reading of the two: a non-boolean in a boolean field is a corrupt response,
+    and ``nudged=True`` inferred from the truthiness of a string is a claim the API never made.
+    """
+    return value if isinstance(value, bool) else default
+
+
+def _number(value: Any, default: int = 0) -> int:
+    """An integer field, or ``default`` when the API sent something else.
+
+    ``int(value)`` was here, and it raised ``TypeError`` on a JSON ``null`` — in a module whose
+    contract, stated at the top, is that a response this SDK does not expect is tolerated rather
+    than fatal. A null ``credits`` crashed a push that had already been charged for, and the caller
+    could not read the result they had paid for.
+
+    An integral ``float`` is accepted because JSON has one number type: a proxy or a language
+    boundary that re-serialises ``1`` as ``1.0`` must not silently turn one credit into zero. A
+    ``bool`` is not, because ``True`` is an ``int`` in Python and ``"credits": true`` meaning one
+    credit is a coincidence of the language rather than anything the API said.
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return default
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     """RFC 3339 to an aware datetime, or ``None``.
 
@@ -110,9 +170,9 @@ class SmsOutcome:
     @classmethod
     def from_api(cls, payload: Payload) -> SmsOutcome:
         return cls(
-            queued=bool(payload.get("queued", False)),
-            credits=int(payload.get("credits", 0)),
-            skipped_reason=payload.get("skipped_reason"),
+            queued=_flag(payload.get("queued")),
+            credits=_number(payload.get("credits")),
+            skipped_reason=_opt_text(payload.get("skipped_reason")),
             escalates_at=_parse_datetime(payload.get("escalates_at")),
             raw=payload,
         )
@@ -135,10 +195,10 @@ class WhatsAppOutcome:
     @classmethod
     def from_api(cls, payload: Payload) -> WhatsAppOutcome:
         return cls(
-            queued=bool(payload.get("queued", False)),
-            credits=int(payload.get("credits", 0)),
-            skipped_reason=payload.get("skipped_reason"),
-            sms_fallback=bool(payload.get("sms_fallback", False)),
+            queued=_flag(payload.get("queued")),
+            credits=_number(payload.get("credits")),
+            skipped_reason=_opt_text(payload.get("skipped_reason")),
+            sms_fallback=_flag(payload.get("sms_fallback")),
             escalates_at=_parse_datetime(payload.get("escalates_at")),
             raw=payload,
         )
@@ -165,9 +225,9 @@ class WhatsAppOptInOutcome:
     @classmethod
     def from_api(cls, payload: Payload) -> WhatsAppOptInOutcome:
         return cls(
-            recorded=bool(payload.get("recorded", False)),
+            recorded=_flag(payload.get("recorded")),
             status=coerce(RecipientStatus, payload.get("status")),
-            skipped_reason=payload.get("skipped_reason"),
+            skipped_reason=_opt_text(payload.get("skipped_reason")),
             raw=payload,
         )
 
@@ -211,22 +271,22 @@ class MessagePushResult:
         whatsapp = payload.get("whatsapp")
         opt_in = payload.get("whatsapp_opt_in")
         return cls(
-            id=str(payload.get("id", "")),
-            subject=str(payload.get("subject", "")),
+            id=_text(payload.get("id")),
+            subject=_text(payload.get("subject")),
             kind=coerce(MessageKind, payload.get("kind")),
             status=coerce(MessageStatus, payload.get("status")),
-            created=bool(payload.get("created", False)),
-            nudged=bool(payload.get("nudged", False)),
+            created=_flag(payload.get("created")),
+            nudged=_flag(payload.get("nudged")),
             created_at=_require_datetime(payload.get("created_at")),
             updated_at=_require_datetime(payload.get("updated_at")),
             scheduled_for=_parse_datetime(payload.get("scheduled_for")),
             sms=SmsOutcome.from_api(sms) if isinstance(sms, dict) else None,
-            sms_units=int(payload.get("sms_units", 0)),
+            sms_units=_number(payload.get("sms_units")),
             whatsapp=WhatsAppOutcome.from_api(whatsapp) if isinstance(whatsapp, dict) else None,
             whatsapp_opt_in=(
                 WhatsAppOptInOutcome.from_api(opt_in) if isinstance(opt_in, dict) else None
             ),
-            reference=payload.get("reference"),
+            reference=_opt_text(payload.get("reference")),
             raw=payload,
         )
 
@@ -247,11 +307,11 @@ class BatchItemResult:
     def from_api(cls, payload: Payload) -> BatchItemResult:
         result = payload.get("result")
         return cls(
-            index=int(payload.get("index", 0)),
-            ok=bool(payload.get("ok", False)),
+            index=_number(payload.get("index")),
+            ok=_flag(payload.get("ok")),
             result=MessagePushResult.from_api(result) if isinstance(result, dict) else None,
-            error_code=payload.get("error_code"),
-            detail=payload.get("detail"),
+            error_code=_opt_text(payload.get("error_code")),
+            detail=_opt_text(payload.get("detail")),
             raw=payload,
         )
 
@@ -284,8 +344,8 @@ class BatchResult:
                 for item in (items if isinstance(items, list) else [])
                 if isinstance(item, dict)
             ),
-            succeeded=int(payload.get("succeeded", 0)),
-            failed=int(payload.get("failed", 0)),
+            succeeded=_number(payload.get("succeeded")),
+            failed=_number(payload.get("failed")),
             raw=payload,
         )
 
@@ -305,8 +365,8 @@ class SmsDelivery:
     def from_api(cls, payload: Payload) -> SmsDelivery:
         return cls(
             status=coerce(ChannelSendStatus, payload.get("status")),
-            credits_charged=int(payload.get("credits_charged", 0)),
-            skipped_reason=payload.get("skipped_reason"),
+            credits_charged=_number(payload.get("credits_charged")),
+            skipped_reason=_opt_text(payload.get("skipped_reason")),
             submitted_at=_parse_datetime(payload.get("submitted_at")),
             last_status_at=_parse_datetime(payload.get("last_status_at")),
             raw=payload,
@@ -335,7 +395,7 @@ class NotSent:
     @classmethod
     def from_api(cls, payload: Payload) -> NotSent:
         return cls(
-            reason=str(payload.get("reason", "")),
+            reason=_text(payload.get("reason")),
             at=_parse_datetime(payload.get("at")),
             raw=payload,
         )
@@ -368,9 +428,9 @@ class DeliveryStatus:
         sms = payload.get("sms")
         not_sent = payload.get("not_sent")
         return cls(
-            delivered=bool(payload.get("delivered", False)),
-            opened=bool(payload.get("opened", False)),
-            bounced=bool(payload.get("bounced", False)),
+            delivered=_flag(payload.get("delivered")),
+            opened=_flag(payload.get("opened")),
+            bounced=_flag(payload.get("bounced")),
             delivered_at=_parse_datetime(payload.get("delivered_at")),
             opened_at=_parse_datetime(payload.get("opened_at")),
             bounced_at=_parse_datetime(payload.get("bounced_at")),
@@ -398,9 +458,9 @@ class Message:
     def from_api(cls, payload: Payload) -> Message:
         delivery = payload.get("delivery")
         return cls(
-            id=str(payload.get("id", "")),
-            recipient_email=str(payload.get("recipient_email", "")),
-            subject=str(payload.get("subject", "")),
+            id=_text(payload.get("id")),
+            recipient_email=_text(payload.get("recipient_email")),
+            subject=_text(payload.get("subject")),
             kind=coerce(MessageKind, payload.get("kind")),
             status=coerce(MessageStatus, payload.get("status")),
             created_at=_require_datetime(payload.get("created_at")),
@@ -432,7 +492,7 @@ class MessagePage:
                 for item in (items if isinstance(items, list) else [])
                 if isinstance(item, dict)
             ),
-            next_cursor=payload.get("next_cursor"),
+            next_cursor=_opt_text(payload.get("next_cursor")),
             raw=payload,
         )
 
@@ -458,11 +518,11 @@ class RetractResult:
     @classmethod
     def from_api(cls, payload: Payload) -> RetractResult:
         return cls(
-            id=str(payload.get("id", "")),
+            id=_text(payload.get("id")),
             status=coerce(MessageStatus, payload.get("status")),
-            retracted=bool(payload.get("retracted", False)),
-            sends_cancelled=int(payload.get("sends_cancelled", 0)),
-            already_notified=bool(payload.get("already_notified", False)),
+            retracted=_flag(payload.get("retracted")),
+            sends_cancelled=_number(payload.get("sends_cancelled")),
+            already_notified=_flag(payload.get("already_notified")),
             raw=payload,
         )
 
@@ -479,9 +539,9 @@ class CreditBalance:
     @classmethod
     def from_api(cls, payload: Payload) -> CreditBalance:
         return cls(
-            balance=int(payload.get("balance", 0)),
-            low_balance=bool(payload.get("low_balance", False)),
-            threshold=int(payload.get("threshold", 0)),
+            balance=_number(payload.get("balance")),
+            low_balance=_flag(payload.get("low_balance")),
+            threshold=_number(payload.get("threshold")),
             raw=payload,
         )
 
@@ -503,8 +563,8 @@ class RecipientSms:
     @classmethod
     def from_api(cls, payload: Payload) -> RecipientSms:
         return cls(
-            recipient_email=str(payload.get("recipient_email", "")),
-            phone=payload.get("phone"),
+            recipient_email=_text(payload.get("recipient_email")),
+            phone=_opt_text(payload.get("phone")),
             sms_status=coerce(RecipientStatus, payload.get("sms_status")),
             sms_status_at=_parse_datetime(payload.get("sms_status_at")),
             raw=payload,
@@ -544,12 +604,12 @@ class WhatsAppErasureReceipt:
     @classmethod
     def from_api(cls, payload: Payload) -> WhatsAppErasureReceipt:
         return cls(
-            replies_deleted=int(payload.get("replies_deleted", 0)),
-            webhook_payloads_scrubbed=int(payload.get("webhook_payloads_scrubbed", 0)),
-            auto_reply_windows_dropped=int(payload.get("auto_reply_windows_dropped", 0)),
-            consent_withdrawn=bool(payload.get("consent_withdrawn", False)),
-            replies_a_forward_email_may_have_carried=int(
-                payload.get("replies_a_forward_email_may_have_carried", 0)
+            replies_deleted=_number(payload.get("replies_deleted")),
+            webhook_payloads_scrubbed=_number(payload.get("webhook_payloads_scrubbed")),
+            auto_reply_windows_dropped=_number(payload.get("auto_reply_windows_dropped")),
+            consent_withdrawn=_flag(payload.get("consent_withdrawn")),
+            replies_a_forward_email_may_have_carried=_number(
+                payload.get("replies_a_forward_email_may_have_carried")
             ),
             forward_setting=coerce(WhatsAppReplyForward, payload.get("forward_setting")),
             first_erased_at=_require_datetime(payload.get("first_erased_at")),
@@ -570,9 +630,9 @@ class ApiKey:
     @classmethod
     def from_api(cls, payload: Payload) -> ApiKey:
         return cls(
-            id=str(payload.get("id", "")),
-            name=str(payload.get("name", "")),
-            masked=str(payload.get("masked", "")),
+            id=_text(payload.get("id")),
+            name=_text(payload.get("name")),
+            masked=_text(payload.get("masked")),
             created=_require_datetime(payload.get("created")),
             raw=payload,
         )
@@ -585,8 +645,21 @@ class NewApiKey:
     :attr:`key` is the **only** time the full value exists anywhere outside the caller. BeaconBox
     stores a hash, so it cannot show it again and cannot recover it for you. Put it straight into
     a secret store: a key that reaches a log line or a support ticket has to be revoked.
+
+    **What is guarded, and what is not.** ``repr`` is redacted, which covers ``print``, an f-string
+    and a ``%r`` or ``%s`` in a log call — the incidental paths. ``dataclasses.asdict`` and
+    :attr:`raw` still carry the value, deliberately: ``raw`` is how a field this SDK predates stays
+    readable. Read :attr:`key`, store it, drop the object.
     """
 
+    id: str
+    """Pass this to :meth:`~beaconbox.resources.Keys.revoke`.
+
+    Without it the only route to the id was to list the keys and match on :attr:`name` — and a name
+    carries no unique constraint and defaults to ``"Untitled key"``, so two unnamed keys are
+    indistinguishable and the match resolves to whichever the ordering happens to put first. That is
+    a wrong-key revocation on the one path that exists to answer a leak.
+    """
     name: str
     key: str
     masked: str
@@ -595,15 +668,23 @@ class NewApiKey:
 
     def __repr__(self) -> str:
         """Redacted, deliberately. A ``print(key)`` in a debugging session is exactly how a live
-        credential reaches a log aggregator. Read :attr:`key` explicitly to get the value."""
-        return f"NewApiKey(name={self.name!r}, key='<redacted>', masked={self.masked!r})"
+        credential reaches a log aggregator. Read :attr:`key` explicitly to get the value.
+
+        The id is included: it is the handle :meth:`~beaconbox.resources.Keys.revoke` takes, and it
+        is not the secret.
+        """
+        return (
+            f"NewApiKey(id={self.id!r}, name={self.name!r}, "
+            f"key='<redacted>', masked={self.masked!r})"
+        )
 
     @classmethod
     def from_api(cls, payload: Payload) -> NewApiKey:
         return cls(
-            name=str(payload.get("name", "")),
-            key=str(payload.get("key", "")),
-            masked=str(payload.get("masked", "")),
+            id=_text(payload.get("id")),
+            name=_text(payload.get("name")),
+            key=_text(payload.get("key")),
+            masked=_text(payload.get("masked")),
             created=_require_datetime(payload.get("created")),
             raw=payload,
         )
@@ -635,16 +716,18 @@ class WebhookEndpoint:
     def from_api(cls, payload: Payload) -> WebhookEndpoint:
         types = payload.get("event_types")
         return cls(
-            id=str(payload.get("id", "")),
-            url=str(payload.get("url", "")),
-            description=str(payload.get("description", "")),
-            secret=str(payload.get("secret", "")),
-            event_types=tuple(str(t) for t in (types if isinstance(types, list) else [])),
-            disabled=bool(payload.get("disabled", False)),
-            consecutive_failures=int(payload.get("consecutive_failures", 0)),
+            id=_text(payload.get("id")),
+            url=_text(payload.get("url")),
+            description=_text(payload.get("description")),
+            secret=_text(payload.get("secret")),
+            event_types=tuple(
+                t for t in (types if isinstance(types, list) else []) if isinstance(t, str)
+            ),
+            disabled=_flag(payload.get("disabled")),
+            consecutive_failures=_number(payload.get("consecutive_failures")),
             created_at=_require_datetime(payload.get("created_at")),
             last_success_at=_parse_datetime(payload.get("last_success_at")),
-            last_error=payload.get("last_error"),
+            last_error=_opt_text(payload.get("last_error")),
             raw=payload,
         )
 
@@ -688,7 +771,7 @@ class WebhookEvent:
     def from_api(cls, payload: Payload) -> WebhookEvent:
         data = payload.get("data")
         return cls(
-            id=str(payload.get("id", "")),
+            id=_text(payload.get("id")),
             type=coerce(WebhookEventType, payload.get("type")),
             occurred_at=_require_datetime(payload.get("occurred_at")),
             data=data if isinstance(data, dict) else {},

@@ -19,9 +19,11 @@ from beaconbox import (
     MessagePush,
     MessagePushResult,
     MessageStatus,
+    RecipientSms,
     RecipientStatus,
     SkipReason,
     SmsOutcome,
+    WebhookEndpoint,
     WebhookEvent,
 )
 from beaconbox.models import _parse_datetime
@@ -90,6 +92,80 @@ class TestForwardCompatibility:
         assert result.sms is None
         assert result.whatsapp is None
         assert result.whatsapp_opt_in is None
+
+    def test_a_null_in_a_required_field_does_not_raise(self) -> None:
+        """The tolerance this module promises, on the shape that used to break it.
+
+        ``int(None)`` and ``str(None)`` were the parser, so an explicit JSON ``null`` in a numeric
+        field raised ``TypeError`` out of a push that had already been charged for, and a null in a
+        string field produced the four-character string ``"None"``.
+        """
+        result = MessagePushResult.from_api(
+            {**PUSH_RESULT, "id": None, "subject": None, "sms_units": None, "reference": None}
+        )
+
+        assert result.id == ""
+        assert result.subject == ""
+        assert result.sms_units == 0
+        assert result.reference is None
+
+    def test_a_null_credit_count_does_not_raise(self) -> None:
+        outcome = SmsOutcome.from_api({"queued": False, "credits": None})
+
+        assert outcome.credits == 0
+
+    def test_an_integral_float_is_read_as_the_integer(self) -> None:
+        """JSON has one number type, and a hop that re-serialises ``1`` as ``1.0`` must not turn
+        one credit into zero."""
+        assert SmsOutcome.from_api({"queued": True, "credits": 1.0}).credits == 1
+
+    def test_a_boolean_is_not_read_as_a_number(self) -> None:
+        """``True`` is an ``int`` in Python, which is a fact about Python and not about the API."""
+        assert SmsOutcome.from_api({"queued": True, "credits": True}).credits == 0
+
+    def test_a_wrongly_typed_optional_string_reads_as_absent(self) -> None:
+        """Rather than handing back an int a caller would compare against ``SkipReason``."""
+        assert (
+            SmsOutcome.from_api({"queued": False, "credits": 1, "skipped_reason": 7}).skipped_reason
+            is None
+        )
+
+    @pytest.mark.parametrize("value", [None, 7, True, [], {}])
+    def test_an_enum_field_is_only_ever_a_member_or_a_string(self, value: object) -> None:
+        """`coerce` returned `value` unchanged, so a null enum field produced `None` and a number
+        produced an `int` — values the `RecipientStatus | str` annotation said could not be there.
+
+        The empty string rather than a `repr`: `""` is obviously absent, where `"None"` or `"7"`
+        looks like something the server sent. The PHP SDK has always read these as `""`.
+        """
+        parsed = RecipientSms.from_api({"recipient_email": "a@b.c", "sms_status": value})
+
+        assert parsed.sms_status == ""
+        assert isinstance(parsed.sms_status, str)
+
+    def test_a_known_enum_value_still_becomes_the_member(self) -> None:
+        parsed = RecipientSms.from_api({"recipient_email": "a@b.c", "sms_status": "stopped"})
+
+        assert parsed.sms_status is RecipientStatus.STOPPED
+
+    def test_a_boolean_field_is_not_pythons_truthiness(self) -> None:
+        """The PHP SDK reads `"queued": "yes"` as false, because its parser tests `is_bool`.
+
+        `bool(value)` here read it as true, so two workers in two languages disagreed about whether
+        a message had been sent, from the same payload. Strict is the safer reading of the pair: a
+        non-boolean in a boolean field is a corrupt response, not a claim the API made.
+        """
+        assert SmsOutcome.from_api({"queued": "yes", "credits": 1}).queued is False
+        assert SmsOutcome.from_api({"queued": None, "credits": 1}).queued is False
+        assert SmsOutcome.from_api({"queued": 1, "credits": 1}).queued is False
+        assert SmsOutcome.from_api({"queued": True, "credits": 1}).queued is True
+
+    def test_a_non_string_event_type_is_dropped_rather_than_stringified(self) -> None:
+        endpoint = WebhookEndpoint.from_api(
+            {"id": "wh_1", "event_types": ["message.opened", 7, None, "sms.failed"]}
+        )
+
+        assert endpoint.event_types == ("message.opened", "sms.failed")
 
 
 class TestOutcomes:
@@ -229,6 +305,7 @@ class TestSecrets:
 
         key = NewApiKey.from_api(
             {
+                "id": "k_7Hq2",
                 "name": "orders",
                 "key": "bbx_live_theactualsecret",
                 "masked": "bbx_live_••••••••cret",
@@ -238,6 +315,8 @@ class TestSecrets:
 
         assert "theactualsecret" not in repr(key)
         assert key.key == "bbx_live_theactualsecret"
+        # The id is in the repr: it is the handle for revoking, and it is not the secret.
+        assert "k_7Hq2" in repr(key)
 
     def test_a_new_endpoints_secret_is_redacted_in_its_repr(self) -> None:
         from beaconbox import NewWebhookEndpoint

@@ -88,11 +88,32 @@ def verify(
             f"{tolerance_seconds}s tolerance."
         )
 
-    expected = hmac.new(secret.encode(), f"{timestamp}.".encode() + raw, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, signature):
+    expected = hmac.new(secret.encode(), f"{timestamp}.".encode() + raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, _hex_to_bytes(signature)):
         raise WebhookVerificationError("BeaconBox: webhook signature does not match.")
 
     return _decode(raw)
+
+
+def _hex_to_bytes(signature: str) -> bytes:
+    """The header's ``v1=`` value as raw bytes, for a constant-time compare against the digest.
+
+    **Comparing bytes rather than the hex strings is a fix, not a style choice.**
+    ``hmac.compare_digest`` raises ``TypeError`` when handed a ``str`` containing any non-ASCII
+    character, and ``signature`` comes from a header an unauthenticated caller writes. Comparing
+    the hex text therefore let ``POST /hooks/beaconbox`` with ``v1=é`` escape this module as a
+    ``TypeError``: the documented ``except WebhookVerificationError`` around this call did not
+    catch it, so a hostile header turned the intended 400 into a 500 and a stack trace.
+
+    A value that is not hex cannot be a signature, so it returns bytes that will not match rather
+    than raising. The length and shape of a signature are not secret, so short-circuiting on them
+    leaks nothing; what must stay constant-time is the comparison of the bytes themselves, and
+    that is :func:`hmac.compare_digest`'s job above.
+    """
+    try:
+        return bytes.fromhex(signature)
+    except ValueError:
+        return b""
 
 
 def _parse_header(header: str) -> tuple[int, str]:

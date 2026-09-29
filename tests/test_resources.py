@@ -7,6 +7,7 @@ unit tests that only asserted "a POST happened" were happy with and a real serve
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import ClassVar
 from urllib.parse import parse_qs, urlsplit
@@ -20,6 +21,7 @@ from beaconbox import (
     MessagePush,
     ResourceMissingError,
     SkipReason,
+    async_resources,
 )
 from tests.conftest import MESSAGE_VIEW, PUSH_RESULT, Reply, make_client
 
@@ -379,6 +381,7 @@ class TestKeys:
             Reply(
                 201,
                 {
+                    "id": "k_7Hq2",
                     "name": "orders",
                     "key": "bbx_live_secret",
                     "masked": "bbx_live_••••••••cret",
@@ -391,6 +394,9 @@ class TestKeys:
 
         assert json.loads(recorder.only.content) == {"name": "orders"}
         assert key.key == "bbx_live_secret"
+        # The id is what `revoke` takes. Without it a caller had to list and match on `name`, which
+        # is ambiguous: a name is not unique and defaults to "Untitled key".
+        assert key.id == "k_7Hq2"
 
     def test_revoke_handles_a_204(self) -> None:
         client, recorder = make_client(Reply(204))
@@ -492,3 +498,23 @@ class TestPaginationCannotHang:
 
         assert len(list(client.messages.iterate())) == 1
         assert len(recorder.requests) == 1
+
+    @pytest.mark.parametrize("page_size", [0, -1])
+    def test_a_page_size_below_one_is_refused(self, page_size: int) -> None:
+        """The server clamps `limit` into its own range, so this is not an error there — it
+        quietly becomes one message per request, and a merchant walking a year of history meets
+        that as a job that takes hours rather than as a mistake in their call."""
+        client, recorder = make_client(Reply(200, {"items": [], "next_cursor": None}))
+
+        with pytest.raises(ValueError, match="page_size must be at least 1"):
+            list(client.messages.iterate(page_size=page_size))
+
+        assert recorder.requests == []
+
+    def test_the_async_client_does_not_carry_its_own_copy_of_the_rule(self) -> None:
+        """Both `iterate` generators go through `_PageWalk`, so the check and the sentence
+        explaining it exist once. Written out twice, a safety check gets improved in one copy."""
+        source = inspect.getsource(async_resources)
+
+        assert "_PageWalk" in source
+        assert "did not advance" not in source

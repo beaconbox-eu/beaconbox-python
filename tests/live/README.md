@@ -19,7 +19,7 @@ when you have changed something both SDKs share.
 
 ```bash
 export BEACONBOX_LIVE_URL=https://api.beaconbox.localhost
-export BEACONBOX_API_KEY=$(../../scripts/seed.sh | python -c 'import json,sys; print(json.load(sys.stdin)["api_key"])')
+export BEACONBOX_API_KEY=$(../../scripts/seed.sh --credits 200 | python -c 'import json,sys; print(json.load(sys.stdin)["api_key"])')
 export BEACONBOX_LIVE_CA_BUNDLE="$(mkcert -CAROOT)/rootCA.pem"
 pytest tests/live -q
 ```
@@ -32,6 +32,12 @@ does that rather than turning verification off and leaving the SDK's security de
 
 `BEACONBOX_LIVE_RECIPIENT` overrides the recipient address, and defaults to
 `live-sdk@example.com`.
+
+**`--credits` is what makes the paid-send test run at all.** A seeded world has a zero balance, so
+every push answers `insufficient_credit`, `delivery.sms` stays null, and
+`test_a_paid_sms_send_reports_its_delivery` skips with a message saying so. `mise run //sdk:live`
+passes it for you. The default stays zero because the Playwright suite asserts the balance it grants
+to the digit — see `api/cli/e2e.py`.
 
 ## What they are for
 

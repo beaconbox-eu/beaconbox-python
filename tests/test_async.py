@@ -235,3 +235,12 @@ class TestPaginationCannotHang:
             [m async for m in client.messages.iterate()]
 
         assert len(recorder.requests) == 2
+
+    async def test_a_page_size_below_one_is_refused_here_too(self) -> None:
+        """Same guard as the sync client, because it is the same object."""
+        client, recorder = make_async_client(Reply(200, {"items": [], "next_cursor": None}))
+
+        with pytest.raises(ValueError, match="page_size must be at least 1"):
+            [m async for m in client.messages.iterate(page_size=0)]
+
+        assert recorder.requests == []
