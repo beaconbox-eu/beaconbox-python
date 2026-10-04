@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import pathlib
+import ssl
 from typing import Any, cast
 
+import certifi  # an unconditional dependency of httpx, so always present wherever this SDK is
 import httpx
 import pytest
 
@@ -48,6 +51,14 @@ class TestApiKeyResolution:
 class TestSecrets:
     def test_the_key_is_not_in_the_repr(self) -> None:
         client, _ = make_client()
+        assert API_KEY not in repr(client)
+        assert BASE_URL in repr(client)
+
+    def test_the_key_is_not_in_the_async_repr_either(self) -> None:
+        """Asserted separately because it is a separate method on a separate class, and the promise
+        that a client never carries its credential into a log line is made for both."""
+        client = AsyncBeaconBox(API_KEY, base_url=BASE_URL)
+
         assert API_KEY not in repr(client)
         assert BASE_URL in repr(client)
 
@@ -106,6 +117,34 @@ class TestSecurityDefaults:
         client = BeaconBox(API_KEY, base_url=BASE_URL, timeout=httpx.Timeout(5.0, connect=1.0))
 
         assert client._http.timeout.connect == 1.0
+
+    def test_a_ca_bundle_path_becomes_an_ssl_context(self, tmp_path: pathlib.Path) -> None:
+        """The documented way to trust a corporate CA, and it has to arrive as a context.
+
+        httpx deprecated ``verify=<path>``, so passing the path straight through would hand the
+        person who configured their CA correctly a ``DeprecationWarning`` for their trouble, and
+        send them looking for the way to silence it that ends in ``verify=False``.
+        """
+        # A real bundle at a path of our own, rather than certifi's own location, because the
+        # thing under test is that an arbitrary path is read.
+        bundle = tmp_path / "corporate-ca.pem"
+        bundle.write_text(certifi.contents(), encoding="ascii")
+
+        client = BeaconBox(API_KEY, base_url=BASE_URL, verify=str(bundle))
+
+        context = cast(Any, client._http._transport)._pool._ssl_context
+        assert isinstance(context, ssl.SSLContext)
+        assert context.verify_mode is ssl.CERT_REQUIRED
+
+    def test_a_path_like_bundle_is_accepted_as_well_as_a_string(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        bundle = tmp_path / "corporate-ca.pem"
+        bundle.write_text(certifi.contents(), encoding="ascii")
+
+        client = BeaconBox(API_KEY, base_url=BASE_URL, verify=bundle)
+
+        assert isinstance(cast(Any, client._http._transport)._pool._ssl_context, ssl.SSLContext)
 
 
 def _pool_ceiling(client: BeaconBox | AsyncBeaconBox) -> int:

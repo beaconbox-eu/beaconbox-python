@@ -28,6 +28,7 @@ from .models import (
     RetractResult,
     SmsOutcome,
     WebhookEndpoint,
+    WebhookTestResult,
     WhatsAppErasureReceipt,
     WhatsAppOutcome,
 )
@@ -58,8 +59,7 @@ def push(body: Payload) -> Call[MessagePushResult]:
 
 
 def push_batch(bodies: Sequence[Payload]) -> Call[BatchResult]:
-    # `items`, which is what the API's MessageBatchPush declares. The name matters: a batch sent
-    # under any other key is a 422 that only shows up against a real server.
+    # `items` is the key the API declares for a batch body. Any other name is a 422.
     return Call("POST", "/messages/batch", BatchResult.from_api, body={"items": list(bodies)})
 
 
@@ -184,6 +184,18 @@ def create_webhook_endpoint(
         "/webhook-endpoints",
         NewWebhookEndpoint.from_api,
         body={"url": url, "event_types": list(event_types), "description": description},
+    )
+
+
+def test_webhook_endpoint(public_id: str) -> Call[WebhookTestResult]:
+    return Call(
+        "POST",
+        f"/webhook-endpoints/{path_segment(public_id)}/test",
+        WebhookTestResult.from_api,
+        route="/webhook-endpoints/{id}/test",
+        # No body, and no idempotency key: this writes nothing. Sending the same test twice is two
+        # tests, which is what somebody pressing it twice means.
+        body={},
     )
 
 

@@ -6,6 +6,7 @@ These need no client and no fake network, which is the point of the module they 
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
@@ -139,6 +140,13 @@ class TestBaseUrl:
         """
         with pytest.raises(ValueError, match="query string or fragment"):
             core(url)
+
+    @pytest.mark.parametrize("base_url", ["https://", "http://", "https:///api"])
+    def test_a_base_url_with_no_host_is_refused(self, base_url: str) -> None:
+        """A scheme on its own is not somewhere requests can go, and the failure it otherwise
+        produces is an opaque one from inside httpx at the first call rather than here."""
+        with pytest.raises(ValueError, match="must include a host"):
+            core(base_url=base_url)
 
     def test_a_base_url_may_carry_a_path_prefix(self) -> None:
         """A gateway that mounts BeaconBox under a prefix is a real deployment, unlike a query."""
@@ -292,9 +300,43 @@ class TestRetryAfter:
     def test_is_case_insensitive(self) -> None:
         assert retry_after_seconds({"retry-after": "3"}) == 3.0
 
+    def test_reads_a_fractional_value(self) -> None:
+        """A server that said 1.5 said something more precise than 2."""
+        assert retry_after_seconds({"Retry-After": "1.5"}) == 1.5
+
     @pytest.mark.parametrize("value", ["Wed, 21 Oct 2026 07:28:00 GMT", "soon", "-5", ""])
     def test_anything_it_cannot_trust_falls_back_to_our_own_backoff(self, value: str) -> None:
         assert retry_after_seconds({"Retry-After": value}) is None
+
+    @pytest.mark.parametrize(
+        "value",
+        ["1e3", "+5", ".5", "inf", "Infinity", "nan", "1_000", "\u0665"],  # \u0665: Arabic-Indic 5
+    )
+    def test_everything_float_would_accept_and_no_server_sends(self, value: str) -> None:
+        r"""``float()`` reads every one of these, and none of them is a ``Retry-After``.
+
+        ``1e3`` would become a thousand-second wait and ``inf`` a wait no policy can bound, each
+        chosen by a malformed header rather than by the server. The last is why the pattern spells
+        out ``[0-9]``: ``\d`` matches every Unicode decimal digit, and ``float()`` reads those too.
+        """
+        assert retry_after_seconds({"Retry-After": value}) is None
+
+    @pytest.mark.parametrize("digits", [21, 400, 10_000])
+    def test_an_absurdly_long_value_is_refused_rather_than_read_as_infinity(
+        self, digits: int
+    ) -> None:
+        """``float()`` does not raise on a long digit run, it returns ``inf``.
+
+        An ``inf`` on ``APIError.retry_after`` is a number a caller may hand to ``sleep()``, so the
+        grammar is length-bounded and this falls back to the SDK's own backoff instead.
+        """
+        assert retry_after_seconds({"Retry-After": "9" * digits}) is None
+
+    def test_the_longest_value_it_accepts_is_finite(self) -> None:
+        value = retry_after_seconds({"Retry-After": "9" * 20})
+
+        assert value is not None
+        assert math.isfinite(value)
 
     def test_absent_header(self) -> None:
         assert retry_after_seconds({}) is None

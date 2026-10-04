@@ -36,6 +36,7 @@ __all__ = [
     "BatchResult",
     "CreditBalance",
     "DeliveryStatus",
+    "EmailOutcome",
     "Message",
     "MessagePage",
     "MessagePush",
@@ -49,6 +50,7 @@ __all__ = [
     "SmsOutcome",
     "WebhookEndpoint",
     "WebhookEvent",
+    "WebhookTestResult",
     "WhatsAppErasureReceipt",
     "WhatsAppOptInOutcome",
     "WhatsAppOutcome",
@@ -57,14 +59,19 @@ __all__ = [
 Payload = dict[str, Any]
 
 
+#: The range a number in this API can occupy. Named rather than written inline because
+#: :func:`_opt_number` checks it twice, once per numeric type, and the two have to mean the same
+#: thing.
+_INT64_MAX = 2**63 - 1
+_INT64_MIN = -(2**63)
+
+
 def _text(value: Any, default: str = "") -> str:
     """A string field, or ``default`` when the API sent something else.
 
-    ``str(value)`` was here and was wrong in the one case that matters: a field the API declares
-    required arriving as JSON ``null`` produced the four-character string ``"None"``, so
-    ``message.id`` could come back as ``"None"`` and be passed happily to the next call. A default
-    that is obviously empty is a value a caller can test; a default that is a plausible-looking
-    string is one they cannot.
+    The default is an obviously empty value a caller can test, rather than a plausible-looking
+    string they cannot: a required field arriving as JSON ``null`` must not become the text
+    ``"None"`` and travel on into the next call as an id.
     """
     return value if isinstance(value, str) else default
 
@@ -72,10 +79,9 @@ def _text(value: Any, default: str = "") -> str:
 def _opt_text(value: Any) -> str | None:
     """An optional string field. Anything that is not a string reads as absent.
 
-    The annotation on every field built through this says ``str | None``, and a bare
-    ``payload.get()`` made that a promise the parser did not keep: a numeric ``skipped_reason``
-    would have been handed to a caller who then compared it against
-    :class:`~beaconbox.enums.SkipReason` and silently matched nothing.
+    Every field built through this is annotated ``str | None``, and this is what keeps that
+    promise: a numerically typed ``skipped_reason`` reads as ``None`` rather than being handed to
+    a caller who would compare it against :class:`~beaconbox.enums.SkipReason` and never match.
     """
     return value if isinstance(value, str) else None
 
@@ -83,14 +89,9 @@ def _opt_text(value: Any) -> str | None:
 def _flag(value: Any, default: bool = False) -> bool:
     """A boolean field, or ``default`` when the API sent something else.
 
-    ``bool(value)`` was here, which is Python's truthiness rather than the API's answer: a
-    ``"queued": "yes"`` from a rewriting proxy read as ``True`` while the PHP SDK, whose parser
-    tests ``is_bool``, read the same payload as ``False``. The README promises the two SDKs agree,
-    and a caller comparing notes across a Python worker and a PHP worker would have found they did
-    not, on whether a message had been sent.
-
-    Strict is the safer reading of the two: a non-boolean in a boolean field is a corrupt response,
-    and ``nudged=True`` inferred from the truthiness of a string is a claim the API never made.
+    Read strictly rather than through Python's truthiness: a non-boolean in a boolean field is a
+    corrupt response, and ``nudged=True`` inferred from the truthiness of a string is a claim the
+    API never made.
     """
     return value if isinstance(value, bool) else default
 
@@ -98,23 +99,46 @@ def _flag(value: Any, default: bool = False) -> bool:
 def _number(value: Any, default: int = 0) -> int:
     """An integer field, or ``default`` when the API sent something else.
 
-    ``int(value)`` was here, and it raised ``TypeError`` on a JSON ``null`` — in a module whose
-    contract, stated at the top, is that a response this SDK does not expect is tolerated rather
-    than fatal. A null ``credits`` crashed a push that had already been charged for, and the caller
-    could not read the result they had paid for.
-
     An integral ``float`` is accepted because JSON has one number type: a proxy or a language
     boundary that re-serialises ``1`` as ``1.0`` must not silently turn one credit into zero. A
-    ``bool`` is not, because ``True`` is an ``int`` in Python and ``"credits": true`` meaning one
-    credit is a coincidence of the language rather than anything the API said.
+    non-integral float is not coerced, since a truncated ``1.5`` is its own kind of wrong. A
+    ``bool`` is not read as a number either: ``True`` being an ``int`` is a fact about Python
+    rather than anything the API said.
+    """
+    coerced = _opt_number(value)
+    return coerced if coerced is not None else default
+
+
+def _opt_number(value: Any) -> int | None:
+    """Like :func:`_number`, but an unusable value reads as absent rather than as a number.
+
+    For a field where ``0`` is itself a real answer and "could not be determined" is a different
+    one. :attr:`WebhookTestResult.status_code` is exactly that: a ``0`` there would read as an
+    HTTP status.
+
+    NaN and infinity are rejected rather than converted. Both are reachable from a JSON body
+    (:func:`json.loads` accepts the literals), and ``int()`` raises on either, which would make
+    this parse layer fatal on a malformed response in a module whose whole contract is that it is
+    not.
+
+    A value outside signed 64-bit range is rejected too. Python's integers are unbounded, so
+    nothing here would fail on one: ``{"credits": 1e300}`` would read as a 300-digit number and
+    travel on into a merchant's own arithmetic, formatting and database. No count this API reports
+    can exceed an ``int64``, so one that does is a corrupt response rather than a large answer, and
+    the bound is also what keeps this field-for-field identical to the PHP client, whose integers
+    stop there.
     """
     if isinstance(value, bool):
-        return default
+        return None
     if isinstance(value, int):
-        return value
+        return value if _INT64_MIN <= value <= _INT64_MAX else None
     if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return default
+        # Strict inequalities, and both matter. `float(_INT64_MAX)` rounds *up* to 2**63, so an
+        # inclusive upper bound admits a float one larger than any int64 and `int()` then returns
+        # it. `float(_INT64_MIN)` is exact, so the lower bound excludes only the value itself,
+        # which is the same trade the PHP client makes for the same reason.
+        return int(value) if float(_INT64_MIN) < value < float(_INT64_MAX) else None
+    return None
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -138,6 +162,65 @@ def _parse_datetime(value: Any) -> datetime | None:
 def _require_datetime(value: Any) -> datetime:
     """For a field the API declares required. Falls back to the epoch rather than raising."""
     return _parse_datetime(value) or datetime.fromtimestamp(0, tz=timezone.utc)
+
+
+@dataclass(frozen=True)
+class EmailOutcome:
+    """The email side of a push: whether the nudge is expected to go, and why not if it is not.
+
+    **Its own type, like :class:`SmsOutcome` and :class:`WhatsAppOutcome`, because suppression is
+    per channel.** A recipient who texted STOP has suppressed SMS and nothing else; a hard bounce
+    suppresses email and nothing else. Reading one channel's reason off another's block would tell
+    you a channel is blocked when it is not.
+
+    ``sending=False`` is reliable — no email will be sent. ``sending=True`` is a strong
+    expectation rather than a promise: it is the verdict as known when you called, and it cannot
+    see the day's cap filling up between now and the send. Check
+    :attr:`Message.delivery` or subscribe to ``message.not_sent`` for what actually happened.
+    """
+
+    sending: bool
+    skipped_reason: str | None = None
+    """An :class:`~beaconbox.enums.EmailSkipReason` value, or ``None`` when sending.
+
+    Treat an unrecognised value as "not sending" rather than as an error — the list grows."""
+    raw: Payload = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, payload: Payload) -> EmailOutcome:
+        return cls(
+            sending=_flag(payload.get("sending")),
+            skipped_reason=_opt_text(payload.get("skipped_reason")),
+            raw=payload,
+        )
+
+
+@dataclass(frozen=True)
+class WebhookTestResult:
+    """What a manual test POST to one of your endpoints did.
+
+    ``delivered`` is the field to read. The call itself succeeds whatever your endpoint answered —
+    the failure being reported is your server's, not BeaconBox's, so raising would describe the
+    wrong hop.
+    """
+
+    delivered: bool
+    status_code: int | None = None
+    """What your endpoint answered. ``None`` when it could not be reached at all."""
+    error: str | None = None
+    """What went wrong, in words meant for a person."""
+    duration_ms: int = 0
+    raw: Payload = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, payload: Payload) -> WebhookTestResult:
+        return cls(
+            delivered=_flag(payload.get("delivered")),
+            status_code=_opt_number(payload.get("status_code")),
+            error=_opt_text(payload.get("error")),
+            duration_ms=_number(payload.get("duration_ms")),
+            raw=payload,
+        )
 
 
 @dataclass(frozen=True)
@@ -253,6 +336,9 @@ class MessagePushResult:
     updated_at: datetime
     scheduled_for: datetime | None = None
     """When a deferred nudge will be sent, if ``send_at`` held it back."""
+    email: EmailOutcome | None = None
+    """Present when an email nudge was queued. ``None`` when none was — ``notify=False``, or an
+    update that does not re-nudge — because there is then no email outcome to report."""
     sms: SmsOutcome | None = None
     """Present when SMS was in play, queued or explicitly refused. ``None`` when the account has
     SMS off and this push did not ask for it."""
@@ -267,6 +353,7 @@ class MessagePushResult:
 
     @classmethod
     def from_api(cls, payload: Payload) -> MessagePushResult:
+        email = payload.get("email")
         sms = payload.get("sms")
         whatsapp = payload.get("whatsapp")
         opt_in = payload.get("whatsapp_opt_in")
@@ -280,6 +367,7 @@ class MessagePushResult:
             created_at=_require_datetime(payload.get("created_at")),
             updated_at=_require_datetime(payload.get("updated_at")),
             scheduled_for=_parse_datetime(payload.get("scheduled_for")),
+            email=EmailOutcome.from_api(email) if isinstance(email, dict) else None,
             sms=SmsOutcome.from_api(sms) if isinstance(sms, dict) else None,
             sms_units=_number(payload.get("sms_units")),
             whatsapp=WhatsAppOutcome.from_api(whatsapp) if isinstance(whatsapp, dict) else None,
@@ -377,9 +465,9 @@ class SmsDelivery:
 class NotSent:
     """Set when BeaconBox decided not to email a message at all, and that decision still stands.
 
-    **The field that makes ``delivered is False`` readable.** Without it that flag meant two
-    opposite things — *on its way* and *never attempted, and never will be* — so a caller polling
-    for delivery had no way to know when to stop. ``None`` is the ordinary case.
+    **The field that makes ``delivered is False`` readable.** On its own that flag covers two
+    opposite situations, *on its way* and *never attempted, and never will be*; this is what tells
+    them apart, so a caller polling for delivery knows when to stop. ``None`` is the ordinary case.
 
     :attr:`reason` is a plain string rather than an enum, unlike :class:`SmsDelivery`'s
     ``skipped_reason`` companion. The server's list grows whenever a refusal is added to the send
@@ -653,12 +741,10 @@ class NewApiKey:
     """
 
     id: str
-    """Pass this to :meth:`~beaconbox.resources.Keys.revoke`.
+    """The handle for revoking this key: pass it to :meth:`~beaconbox.resources.Keys.revoke`.
 
-    Without it the only route to the id was to list the keys and match on :attr:`name` — and a name
-    carries no unique constraint and defaults to ``"Untitled key"``, so two unnamed keys are
-    indistinguishable and the match resolves to whichever the ordering happens to put first. That is
-    a wrong-key revocation on the one path that exists to answer a leak.
+    Use it rather than matching on :attr:`name`, which carries no unique constraint and defaults to
+    ``"Untitled key"``, so two unnamed keys cannot be told apart.
     """
     name: str
     key: str

@@ -33,6 +33,7 @@ from .models import (
     RetractResult,
     SmsOutcome,
     WebhookEndpoint,
+    WebhookTestResult,
     WhatsAppErasureReceipt,
     WhatsAppOutcome,
 )
@@ -245,6 +246,13 @@ class AsyncWebhookEndpoints(_AsyncResource):
             _ops.create_webhook_endpoint(url, [_value(t) for t in event_types], description),
             idempotency_key,
         )
+
+    async def test(self, public_id: str) -> WebhookTestResult:
+        """Send one sample ``ping`` to this endpoint and report what came back.
+
+        See :meth:`beaconbox.resources.WebhookEndpointsResource.test` — same contract, awaited.
+        """
+        return await self._transport.invoke(_ops.test_webhook_endpoint(public_id))
 
     async def delete(self, public_id: str) -> None:
         """Delete an endpoint."""

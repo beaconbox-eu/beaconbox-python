@@ -5,109 +5,143 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] — 2026-09-29
+## [0.4.0] - 2026-10-04
+
+### Added
+
+- `MessagePushResult.email`, an `EmailOutcome` carrying whether the nudge is expected to send and
+  why not if it is not. Its own type beside `sms` and `whatsapp`, because suppression is per
+  channel: a recipient who texted STOP has suppressed SMS and nothing else, a hard bounce
+  suppresses email and nothing else, and one merged flag could not say which. `sending=False` is
+  reliable; `sending=True` is the verdict as known at push time and cannot see a daily cap filling
+  up before the send, so `Message.delivery` and the `message.not_sent` webhook remain
+  authoritative.
+- `webhook_endpoints.test(public_id)`. Send a sample `ping` to one of your endpoints and read what
+  came back as a `WebhookTestResult`. It never raises for a failure at *your* end, because that
+  failure belongs to your server rather than to the API call: read `delivered`. The event type is
+  `ping` rather than a real one, so a test cannot be mistaken for a genuine delivery by a handler
+  that acts on them, and it is signed exactly like a real delivery, so it also proves your
+  signature verification. It does not touch the endpoint's health counters.
+
+### Security
+
+- `webhooks.verify()` raises `WebhookVerificationError` for a signature header whose `t=` is longer
+  than twenty digits, rather than letting a `ValueError` escape. `int()` refuses a string of more
+  than `sys.get_int_max_str_digits()` digits (4300 by default), and the header is written by
+  whoever POSTs to your endpoint, so a long run of digits reached the documented
+  `except WebhookVerificationError` handler as an unhandled exception: an unauthenticated caller
+  could turn the intended 400 into a 500 and a stack trace.
+
+### Fixed
+
+- `WebhookTestResult.status_code` reads an unusable value as `None` instead of raising or
+  inventing a status. A JSON body may legitimately carry `NaN` or `Infinity`, and converting
+  either to an integer raises, so a malformed response could escape the parse layer as a
+  `ValueError` or `OverflowError` rather than being tolerated the way every other field is. A
+  boolean no longer reads as `1`, and a non-integral float is no longer truncated into a
+  plausible-looking status.
+- `Retry-After` is read as delta-seconds and nothing else. `float()` also accepts `1e3`, `+5`,
+  `.5`, `inf` and non-ASCII digits, so a malformed or hostile header could choose how long a
+  caller blocked, up to a wait no policy could bound. A fractional value such as `1.5` is still
+  honoured exactly.
+- `webhooks.verify()` requires the signature header's `t=` to be ASCII digits. `int()` also
+  accepts a leading sign, surrounding whitespace, underscore separators and other scripts'
+  digits, each of which was a second spelling of a timestamp that has one canonical form and is
+  part of the signed string.
+- A number outside signed 64-bit range reads as absent rather than as a value. Python's integers
+  are unbounded, so `{"credits": 1e300}` read as a 300-digit number and travelled on into a
+  caller's own arithmetic, formatting and database. No count this API reports can exceed an
+  `int64`, so one that does is a corrupt response rather than a large answer.
+- `retry_after` on a `RateLimitError` is always a finite number. `float()` does not raise on a long
+  run of digits, it returns `inf`, and an `inf` here is a value a caller may hand to `sleep()`.
+
+### Changed
+
+- `WebhookVerificationError` for a signature mismatch now names the likely cause. "Signature does
+  not match" reads as a key problem and almost never is: the usual cause is verifying a
+  re-serialized body instead of the raw request bytes, which looks identical and hashes
+  differently. The message says so before it mentions the secret, so nobody rotates a working one.
+
+## [0.3.0] - 2026-09-29
 
 ### Security
 
 - `webhooks.verify()` raises `WebhookVerificationError` for a signature containing a non-ASCII
-  character, rather than letting a `TypeError` escape. `hmac.compare_digest` refuses to compare
-  `str` values that are not ASCII, and the `v1=` value is written by whoever POSTs to the endpoint,
-  so `v1=é` reached the documented `except WebhookVerificationError` handler as an unhandled
-  exception: an unauthenticated caller could turn the intended 400 into a 500 and a stack trace.
-  The comparison is now over the decoded bytes, and a `v1=` that is not hex simply does not match.
+  character, rather than letting a `TypeError` escape. The `v1=` value is written by whoever POSTs
+  to your endpoint, and `hmac.compare_digest` refuses to compare non-ASCII `str` values, so such a
+  signature reached the documented `except WebhookVerificationError` handler as an unhandled
+  exception. The comparison is now over the decoded bytes, and a `v1=` that is not hex simply does
+  not match.
 - An API key containing a control character, a newline or a non-ASCII character is refused at
-  construction. Surrounding whitespace is still stripped, because a key read from a file keeps its
-  trailing newline; what is refused is a `\r\n` *inside* the value, which would reach the
-  `Authorization` header. The message names the problem without quoting the key.
-- A `base_url` carrying a query string or a fragment is refused. It did not fail, it went
-  somewhere else: `https://host?x=1` silently produced `https://host?x=1/api/v1/credits`, with the
-  whole API path swallowed into a query value. The check is on the `?` and `#` themselves rather
-  than on `urlsplit`'s components, because those are the empty string for a bare trailing delimiter
-  — which is falsy, and breaks the URL identically. A path prefix is still allowed, for a gateway
-  that mounts BeaconBox under one.
+  construction, since it would otherwise reach the `Authorization` header verbatim. Surrounding
+  whitespace is still stripped, because a key read from a file keeps its trailing newline. The
+  message names the problem without quoting the key.
+- A `base_url` carrying a query string or a fragment is refused. Such a URL does not fail, it goes
+  somewhere else: `https://host?x=1` produced `https://host?x=1/api/v1/credits`, with the whole
+  API path swallowed into a query value. A path prefix is still allowed, for a gateway that mounts
+  BeaconBox under one.
 
 ### Fixed
 
-- `user_agent_suffix` is made header-safe instead of reaching the header verbatim. httpx keeps the
-  value as given and h11 then refuses to serialise the request, raising `httpx.LocalProtocolError` —
-  an `httpx.HTTPError`, which the transport catches and *retries*. So a `\r\n` in a caller's own
-  configuration spent the whole retry budget and was then reported as "the request did not complete:
-  retry with the same idempotency key". Sanitised rather than refused, because the suffix is a label
-  a human reads, and byte-identical to the PHP SDK's handling of the same input.
+- `user_agent_suffix` is made header-safe rather than reaching the header verbatim, where a stray
+  newline became a transport error that spent the whole retry budget before reporting itself as a
+  request that did not complete. Sanitised rather than refused, because the suffix is a label a
+  human reads.
 - `keys.create()` returns `id`, so the key you just minted can be revoked in one call. The only
-  other route to it was to list the keys and match on `name` — and a name carries no unique
-  constraint and defaults to `"Untitled key"`, so two unnamed keys are indistinguishable and the
-  match resolves to whichever the ordering happens to put first. That is a wrong-key revocation on
-  the one path that exists to answer a leak. Needs the matching API change; `id` is in the `repr`,
-  since it is the handle for revoking and not the secret.
+  other route to it was to list the keys and match on `name`, which carries no unique constraint
+  and defaults to `"Untitled key"`, so two unnamed keys cannot be told apart. `id` is in the
+  `repr`, since it is the handle for revoking and not the secret.
 - Response parsing no longer raises on an explicit JSON `null` in a field the API declares
-  required. `int(None)` raised `TypeError` — so a null `credits` crashed a push that had already
-  been charged for — and `str(None)` produced the four-character string `"None"`, so
-  `message.id` could come back as `"None"` and be passed to the next call. Both now fall back to a
-  zero value, which is what this module's stated tolerance always promised.
+  required. A null numeric field raised `TypeError`, so a null `credits` crashed a push that had
+  already been charged for, and a null string field produced the four-character string `"None"`,
+  so `message.id` could be passed on as `"None"`. Both now fall back to a zero value, which is
+  what this module's stated tolerance always promised.
 - An integral `float` in a numeric field is read as the integer. JSON has one number type, so a
   hop that re-serialises `1` as `1.0` no longer reports zero credits. A `bool` is not read as a
   number: `True` being an `int` is a fact about Python, not about the API.
-- An optional string field that arrives wrongly typed reads as absent rather than being handed
+- An optional string field that arrives wrongly typed reads as absent, rather than being handed
   back as an `int` a caller would compare against `SkipReason` and silently never match.
-- A boolean field is read strictly rather than through Python's truthiness. `"queued": "yes"` from
-  a rewriting proxy read as `True` here while the PHP SDK, whose parser tests `is_bool`, read the
-  same payload as `False` — so two workers in two languages disagreed about whether a message had
-  been sent. Both now agree, on the stricter reading.
+- A boolean field is read strictly rather than through Python's truthiness, so `"queued": "yes"`
+  from a rewriting proxy no longer reads as `True`.
 - A non-string entry in `event_types` is dropped rather than stringified.
-- `enums.coerce` returns only an enum member or a `str`, which is what every field built through it
-  is annotated as. It returned its argument unchanged, so a JSON `null` in an enum field produced
-  `None` and a number produced an `int` — values the `RecipientStatus | str` annotation said could
-  not be there, handed to a caller who would compare them against a member and never match. A
-  non-string now reads as `""`, matching the PHP SDK, and the declared return type is what holds it
-  there: `-> Any` is why mypy could not.
+- `enums.coerce` returns only an enum member or a `str`, which is what every field built through
+  it is annotated as. A non-string now reads as `""`.
 - `messages.iterate()` refuses a `page_size` below 1 on both clients. The server clamps `limit`
-  into its own range, so this was not an error there — it quietly became one message per request.
+  into its own range, so this was not an error there; it quietly became one message per request.
 
 ### Changed
 
-- The repeated-cursor guard shared by the sync and async `iterate()` is one private object,
-  `_PageWalk`, rather than the same check and the same sentence written out twice. Its method is
-  `advance()` rather than `next()`, which on an object driven by a `while` loop invited a reader to
-  assume it was an iterator.
+- The repeated-cursor guard shared by the sync and async `iterate()` is one private object rather
+  than the same check written out twice.
 - `messages.push()` documents `sms_if_whatsapp_fails`, which was the only parameter its docstring
   had omitted, and its `:param:` order now matches the signature.
 
-### Tests
-
-- Three properties the prose claimed and nothing checked: every `:param:` names a real parameter,
-  `push` documents its parameters in signature order, and **the async client's signatures match the
-  sync client's** — the package docstring says "identical signatures" and the async module says
-  "The signatures match exactly". Each was confirmed to fail against a deliberate mutation before
-  being kept.
-
 ### Note
 
-- `NewApiKey` gained `id` as its **first** field. It is a response model built by `from_api`, so this
-  affects only code constructing one positionally by hand.
+- `NewApiKey` gained `id` as its **first** field. It is a response model built by `from_api`, so
+  this affects only code constructing one positionally by hand.
 
-## [0.2.0] — 2026-09-22
+## [0.2.0] - 2026-09-22
 
 ### Added
 
-- `delivery.not_sent` on a message: why no email was ever sent, and when we decided. Present only
-  when that decision stands — a later successful send withdraws it. It is what tells a
-  `delivered` of `False` apart from *never attempted, and never will be*, so a loop polling for
-  delivery now has something to stop on. `EmailSkipReason` lists the known values; `reason` stays a plain string,
-  because the server's list grows and an unknown value must not raise.
+- `delivery.not_sent` on a message: why no email was ever sent, and when the decision was made.
+  Present only while that decision stands, since a later successful send withdraws it. It is what
+  tells a `delivered` of `False` apart from *never attempted, and never will be*, so a loop
+  polling for delivery now has something to stop on. `EmailSkipReason` lists the known values;
+  `reason` stays a plain string, because the server's list grows and an unknown value must not
+  raise.
 - `message.not_sent` webhook event, carrying the same `reason`. Deliberately not folded into
   `message.failed`: nothing was attempted and nothing bounced.
 - `plan.past_due`, `plan.lapsed` and `plan.allowance_exceeded` webhook events. The second is the
-  one to alert on — it means email sending has stopped, and every nudge from then on produces a
+  one to alert on. It means email sending has stopped, and every nudge from then on produces a
   `message.not_sent` with `reason: "plan_lapsed"` until the subscription is paid.
 
 ### Fixed
 
 - `MessagePush` and the two types above are listed in their own modules' `__all__`. `MessagePush`
-  had been missing since 0.1.0: it was re-exported from `beaconbox` and documented, but
-  `from beaconbox.models import *` silently omitted it. A test now pins every public type into
-  its module's `__all__` and into the package root, so this cannot recur — nothing had been
-  checking, which is why it went unnoticed through a release.
+  was re-exported from `beaconbox` and documented, but `from beaconbox.models import *` omitted
+  it. A test now pins every public type into its module's `__all__` and into the package root.
 
 ### Note
 
@@ -118,7 +152,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `BeaconBox` and `AsyncBeaconBox` clients, with the same 18 operations and identical signatures.
+- `BeaconBox` and `AsyncBeaconBox` clients, with the same operations and identical signatures.
 - Typed models for every response, with `py.typed`. Unknown fields remain available via `.raw`.
 - Cursor pagination via `messages.iterate()`, and `async for` on the async client.
 - Webhook signature verification via `beaconbox.webhooks.verify()`.
@@ -142,6 +176,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python 3.10+
 - [httpx](https://www.python-httpx.org) `>=0.28.1,<1`
 
+[0.4.0]: https://github.com/beaconbox-eu/beaconbox-python/releases/tag/v0.4.0
 [0.3.0]: https://github.com/beaconbox-eu/beaconbox-python/releases/tag/v0.3.0
 [0.2.0]: https://github.com/beaconbox-eu/beaconbox-python/releases/tag/v0.2.0
 [0.1.0]: https://github.com/beaconbox-eu/beaconbox-python/releases/tag/v0.1.0

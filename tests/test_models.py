@@ -25,6 +25,7 @@ from beaconbox import (
     SmsOutcome,
     WebhookEndpoint,
     WebhookEvent,
+    WebhookTestResult,
 )
 from beaconbox.models import _parse_datetime
 from tests.conftest import MESSAGE_VIEW, PUSH_RESULT
@@ -94,11 +95,11 @@ class TestForwardCompatibility:
         assert result.whatsapp_opt_in is None
 
     def test_a_null_in_a_required_field_does_not_raise(self) -> None:
-        """The tolerance this module promises, on the shape that used to break it.
+        """The tolerance this module promises, on the shape most likely to break it.
 
-        ``int(None)`` and ``str(None)`` were the parser, so an explicit JSON ``null`` in a numeric
-        field raised ``TypeError`` out of a push that had already been charged for, and a null in a
-        string field produced the four-character string ``"None"``.
+        A naive parser raises ``TypeError`` on an explicit JSON ``null`` in a numeric field, out of
+        a push that has already been charged for, and turns a null string field into the
+        four-character string ``"None"``.
         """
         result = MessagePushResult.from_api(
             {**PUSH_RESULT, "id": None, "subject": None, "sms_units": None, "reference": None}
@@ -270,6 +271,67 @@ class TestMessagePushPayload:
         assert payload["escalate_if_unread_after_minutes"] == 120
         assert payload["sms_if_whatsapp_fails"] is True
 
+    def test_every_field_set_serialises_to_exactly_the_documented_wire_names(self) -> None:
+        """The request half of the contract, which a response fixture cannot check.
+
+        A field spelled wrongly here is invisible to every other test in this file: the SDK and the
+        fixture agree with each other and the real API rejects the call. That is not hypothetical
+        for this product, which once sent a batch under a key the API does not read, passing a full
+        unit suite and 422-ing on every real request.
+
+        Asserted as set equality rather than field by field, so a renamed key fails, a dropped key
+        fails, and a key invented here that the API does not declare fails too.
+        """
+        payload = MessagePush(
+            recipient_email="buyer@example.com",
+            subject="Your order has shipped",
+            body="Tracking XY123456789EE.",
+            kind=MessageKind.UPDATEABLE,
+            reference="#A-10294",
+            recipient_phone="+37255550134",
+            channels=("sms", "whatsapp"),
+            notify=True,
+            send_at=datetime(2026, 8, 21, 8, 0, tzinfo=timezone.utc),
+            escalate_if_unread_after_minutes=120,
+            obsoletes=("m_1", "m_2"),
+            whatsapp_opt_in_source="checkout tickbox",
+            sms_if_whatsapp_fails=True,
+        ).to_payload()
+
+        assert set(payload) == {
+            "recipient_email",
+            "subject",
+            "body",
+            "kind",
+            "reference",
+            "recipient_phone",
+            "channels",
+            "notify",
+            "send_at",
+            "escalate_if_unread_after_minutes",
+            "obsoletes",
+            "whatsapp_opt_in",
+            "sms_if_whatsapp_fails",
+        }
+        assert payload["reference"] == "#A-10294"
+        assert payload["recipient_phone"] == "+37255550134"
+        assert payload["channels"] == ["sms", "whatsapp"]
+        assert payload["obsoletes"] == ["m_1", "m_2"]
+        assert payload["notify"] is True
+        assert payload["kind"] == "updateable"
+
+    def test_the_opt_in_source_is_nested_under_its_own_object(self) -> None:
+        """``whatsapp_opt_in`` is an object on the wire and a plain string on this class.
+
+        The API refuses an unknown key inside that object, uniquely among its bodies, so the
+        nesting is the one place a flat ``whatsapp_opt_in="..."`` would become a 422.
+        """
+        payload = MessagePush(
+            recipient_email="a@b.c", subject="s", body="b", whatsapp_opt_in_source="order form"
+        ).to_payload()
+
+        assert payload["whatsapp_opt_in"] == {"source": "order form"}
+
 
 class TestNested:
     def test_a_message_parses_its_whole_delivery_tree(self) -> None:
@@ -341,11 +403,11 @@ class TestSecrets:
 
 
 class TestNotSent:
-    """``delivery.not_sent`` — the field that tells a caller when to stop polling.
+    """``delivery.not_sent``: the field that tells a caller when to stop polling.
 
-    Before it existed, ``delivered is False`` meant both *on its way* and *never attempted, and
-    never will be*, so an integration waiting for a delivery that the server had already declined
-    to attempt waited forever.
+    On its own, ``delivered is False`` covers both *on its way* and *never attempted, and never
+    will be*, so an integration waiting on a delivery the server has declined to attempt would
+    wait forever.
     """
 
     def test_absent_is_none_rather_than_a_missing_key(self) -> None:
@@ -392,3 +454,100 @@ class TestNotSent:
         # what mypy's ``--strict-equality`` rejects as non-overlapping, and it is right to: the
         # member is what a caller compares *to*, not what they compare.
         assert EmailSkipReason.DAILY_CAP_REACHED.value == "daily_cap_reached"
+
+
+class TestWebhookTestResultStatusCode:
+    """``status_code`` is the one field where ``0`` would read as an answer, so it is nullable.
+
+    It is parsed through the same integer coercion as every other numeric field, which is what
+    keeps it in step with the PHP SDK: both read these eight shapes identically.
+    """
+
+    def test_a_status_the_endpoint_answered(self) -> None:
+        result = WebhookTestResult.from_api({"delivered": False, "status_code": 503})
+
+        assert result.status_code == 503
+
+    def test_an_integral_float_is_the_integer(self) -> None:
+        """JSON has one number type, so a re-serialising hop may write 503 as 503.0."""
+        result = WebhookTestResult.from_api({"delivered": False, "status_code": 503.0})
+
+        assert result.status_code == 503
+
+    @pytest.mark.parametrize(
+        ("value", "why"),
+        [
+            (None, "an explicit null"),
+            (True, "a bool, which is an int in Python and nothing to the API"),
+            (200.7, "a non-integral float, where truncating would invent a status"),
+            (float("nan"), "NaN, which int() refuses outright"),
+            (float("inf"), "infinity, which int() refuses outright"),
+            ("200", "a string, however plausible it looks"),
+        ],
+    )
+    def test_anything_that_is_not_a_status_is_unreachable(self, value: object, why: str) -> None:
+        """``None`` rather than a number, and above all never an exception.
+
+        ``NaN`` and ``inf`` are reachable from a real body, because ``json.loads`` accepts both
+        literals, and ``int()`` raises on either. A parse layer whose stated contract is that a
+        response it did not expect is tolerated rather than fatal cannot raise here.
+        """
+        result = WebhookTestResult.from_api({"delivered": False, "status_code": value})
+
+        assert result.status_code is None
+
+    def test_an_absent_status_is_none(self) -> None:
+        assert WebhookTestResult.from_api({"delivered": False}).status_code is None
+
+
+class TestNumbersOutsideInt64:
+    """A count this API reports cannot exceed an ``int64``, so one that does is a corrupt response.
+
+    Python's integers are unbounded, so nothing here fails on a huge one: without the check
+    ``{"credits": 1e300}`` reads as a 300-digit number and travels on into a merchant's own
+    arithmetic, formatting and database. It is also the last shape in which the two SDKs' parse
+    layers disagreed, the PHP one stopping at ``PHP_INT_MAX``.
+    """
+
+    INT64_MAX = 2**63 - 1
+    INT64_MIN = -(2**63)
+
+    def test_the_bounds_themselves_are_read(self) -> None:
+        assert SmsOutcome.from_api({"queued": True, "credits": self.INT64_MAX}).credits == (
+            self.INT64_MAX
+        )
+        assert SmsOutcome.from_api({"queued": True, "credits": self.INT64_MIN}).credits == (
+            self.INT64_MIN
+        )
+
+    @pytest.mark.parametrize("value", [2**63, -(2**63) - 1, 10**30])
+    def test_an_integer_past_the_bound_is_the_default(self, value: int) -> None:
+        assert SmsOutcome.from_api({"queued": True, "credits": value}).credits == 0
+
+    @pytest.mark.parametrize("value", [1e19, 1e300, -1e300, float(-(2**63))])
+    def test_a_float_past_the_bound_is_the_default(self, value: float) -> None:
+        """``float(INT64_MIN)`` is in the list because the bound excludes it on both ends.
+
+        It is exactly representable, so unlike the maximum it is not a rounding artefact; it is
+        refused because the comparison is strict on both sides, which is the same line the PHP
+        client draws. The *integer* ``INT64_MIN`` is still accepted, asserted above.
+        """
+        assert SmsOutcome.from_api({"queued": True, "credits": value}).credits == 0
+
+    def test_the_float_bound_is_strict_because_the_cast_rounds_up(self) -> None:
+        """``float(INT64_MAX)`` rounds *up* to ``2**63``, which is one past any ``int64``.
+
+        An inclusive comparison admits it and ``int()`` then hands it straight back, so the bound
+        has to be strict. This is the one case where the obvious spelling is the wrong one.
+        """
+        assert float(self.INT64_MAX) > self.INT64_MAX
+
+        outcome = SmsOutcome.from_api({"queued": True, "credits": float(self.INT64_MAX)})
+
+        assert outcome.credits == 0
+
+    def test_a_nullable_number_past_the_bound_is_absent_rather_than_clamped(self) -> None:
+        """Clamping would report a wrong status confidently; absent says we could not read one."""
+        result = WebhookTestResult.from_api({"delivered": False, "status_code": 2**63})
+
+        assert result.status_code is None

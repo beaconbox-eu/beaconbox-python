@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import re
 import time
 
 from .errors import WebhookVerificationError
@@ -90,7 +92,19 @@ def verify(
 
     expected = hmac.new(secret.encode(), f"{timestamp}.".encode() + raw, hashlib.sha256).digest()
     if not hmac.compare_digest(expected, _hex_to_bytes(signature)):
-        raise WebhookVerificationError("BeaconBox: webhook signature does not match.")
+        # **Names the likely cause, because the obvious reading of this error is the wrong one.**
+        # "Signature does not match" sounds like a key problem, and the overwhelmingly common cause
+        # is not: it is that the bytes checked are not the bytes sent. Any parse-and-re-serialize —
+        # a framework handing over ``request.json``, a logging proxy, a copy out of a webhook
+        # inspector — reorders keys or re-spaces the JSON and changes the digest completely, while
+        # leaving a body that still looks identical when you read it. Someone who reaches for their
+        # secret first can lose an afternoon before they think to check the body.
+        raise WebhookVerificationError(
+            "BeaconBox: webhook signature does not match. The most common cause is verifying "
+            "against a re-serialized body rather than the raw request bytes — if you parsed the "
+            "JSON first, or copied the body out of a tool that pretty-prints it, verify the "
+            "original bytes instead. Failing that, check the secret belongs to this endpoint."
+        )
 
     return _decode(raw)
 
@@ -98,22 +112,37 @@ def verify(
 def _hex_to_bytes(signature: str) -> bytes:
     """The header's ``v1=`` value as raw bytes, for a constant-time compare against the digest.
 
-    **Comparing bytes rather than the hex strings is a fix, not a style choice.**
-    ``hmac.compare_digest`` raises ``TypeError`` when handed a ``str`` containing any non-ASCII
-    character, and ``signature`` comes from a header an unauthenticated caller writes. Comparing
-    the hex text therefore let ``POST /hooks/beaconbox`` with ``v1=é`` escape this module as a
-    ``TypeError``: the documented ``except WebhookVerificationError`` around this call did not
-    catch it, so a hostile header turned the intended 400 into a 500 and a stack trace.
+    **Decoded rather than compared as text**, because the header is written by whoever POSTs to
+    your endpoint: ``hmac.compare_digest`` raises ``TypeError`` on a ``str`` carrying any
+    non-ASCII character, and a ``v1=é`` that escaped as ``TypeError`` would slip past the
+    documented ``except WebhookVerificationError`` and answer 500 instead of 400.
 
-    A value that is not hex cannot be a signature, so it returns bytes that will not match rather
-    than raising. The length and shape of a signature are not secret, so short-circuiting on them
-    leaks nothing; what must stay constant-time is the comparison of the bytes themselves, and
-    that is :func:`hmac.compare_digest`'s job above.
+    A value that is not hex cannot be a signature, so this returns bytes that will not match
+    rather than raising. The length and shape of a signature are not secret, so short-circuiting
+    on them leaks nothing; what must stay constant-time is the comparison of the bytes themselves,
+    which is :func:`hmac.compare_digest`'s job above.
     """
     try:
         return bytes.fromhex(signature)
     except ValueError:
         return b""
+
+
+_UNIX_SECONDS = re.compile(r"[0-9]{1,20}")
+"""What the ``t=`` value may be: between one and twenty ASCII digits.
+
+Narrower than ``int()``, which also accepts surrounding whitespace, a leading sign, underscores
+as separators and non-ASCII digits from other scripts. The timestamp is part of the signed string,
+so every alternative spelling ``int()`` would accept is another way to write a header that has to
+be checked against one canonical form.
+
+**The length bound is what makes the ``int()`` below unable to raise, and it is load-bearing.**
+``int()`` rejects a string of more than ``sys.get_int_max_str_digits()`` digits (4300 by default)
+with a ``ValueError``, and this value comes from a header an unauthenticated caller writes: an
+unbounded pattern lets them turn the documented ``except WebhookVerificationError`` into a 500 and
+a stack trace. Twenty digits is already far past any Unix timestamp, so widening this gains
+nothing and would reopen that hole.
+"""
 
 
 def _parse_header(header: str) -> tuple[int, str]:
@@ -129,10 +158,8 @@ def _parse_header(header: str) -> tuple[int, str]:
             parts[name] = value
 
     signature = parts.get("v1", "")
-    try:
-        timestamp = int(parts["t"])
-    except (KeyError, ValueError):
-        timestamp = 0
+    raw = parts.get("t", "")
+    timestamp = int(raw) if _UNIX_SECONDS.fullmatch(raw) else 0
     if timestamp <= 0 or not signature:
         raise WebhookVerificationError(
             f"BeaconBox: malformed {SIGNATURE_HEADER} header (expected 't=<unix>,v1=<hex>')."
@@ -142,8 +169,6 @@ def _parse_header(header: str) -> tuple[int, str]:
 
 def _decode(raw: bytes) -> WebhookEvent:
     """Only ever called on bytes already proven to be ours."""
-    import json
-
     try:
         document = json.loads(raw)
     except ValueError as exc:

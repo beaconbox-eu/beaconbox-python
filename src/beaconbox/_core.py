@@ -47,16 +47,9 @@ two spellings of the same character class is one of them drifting later.
 def _header_safe(value: str) -> str:
     """``value`` with anything a header cannot carry collapsed to a single space, then trimmed.
 
-    For the ``User-Agent`` suffix, which is a label a human reads rather than a credential: a stray
-    newline in it must not fail the constructor, and must not reach the header either. **It used to
-    reach it.** httpx keeps the value verbatim, and h11 then refuses to serialise the request — so a
-    suffix with a ``\r\n`` in it produced an ``httpx.LocalProtocolError``, which is an
-    ``httpx.HTTPError``, which :mod:`beaconbox._transport` catches and *retries*. The caller spent
-    the whole retry budget on a request that could never be sent and was then told "the request did
-    not complete: retry with the same idempotency key", about a typo in their own configuration.
-
-    Sanitised rather than refused, and identical to the PHP SDK's ``buildUserAgent``, so the same
-    suffix produces the same ``User-Agent`` in both.
+    For the ``User-Agent`` suffix, which is a label a human reads rather than a credential.
+    Sanitised rather than refused: a stray newline in a caller's own configuration should not fail
+    the constructor, and must not reach the header either.
     """
     return _UNSAFE_IN_HEADER.sub(" ", value).strip()
 
@@ -64,12 +57,11 @@ def _header_safe(value: str) -> str:
 def _fits_in_a_header(value: str) -> bool:
     """Whether ``value`` can go in an HTTP header: printable ASCII, nothing else.
 
-    An API key is base62, so this rejects nothing legitimate. What it catches is the key pasted with
-    a trailing newline still inside it, or with a smart quote substituted by a word processor.
-    Without the check a ``\r\n`` in the key reaches the header the transport builds, which is
-    request smuggling with the caller's own credential as the payload; the best case is an opaque
-    encoding error thrown from inside httpx at the first request rather than a sentence naming the
-    problem where it happened.
+    An API key is base62, so this rejects nothing legitimate. What it catches is a key pasted with
+    a trailing newline still inside it, or with a smart quote substituted by a word processor. A
+    ``\r\n`` within a credential must never reach the ``Authorization`` header, and the refusal
+    names the problem where it happened rather than surfacing as an encoding error at the first
+    request.
     """
     return _UNSAFE_IN_HEADER.search(value) is None
 
@@ -115,11 +107,22 @@ class Call(Generic[T]):
 
     @property
     def needs_idempotency(self) -> bool:
-        """Every ``POST`` in this API requires an ``Idempotency-Key``, and nothing else does.
+        """Send an ``Idempotency-Key`` on every ``POST``, which is a deliberate superset.
 
-        ``PUT`` and ``DELETE`` on a recipient's phone number are idempotent by construction:
-        setting a number twice leaves one number. Sending a message twice sends two messages and
-        charges two credits, which is the whole reason the header is mandatory on ``POST``.
+        The API *requires* one on six operations, all of them POSTs that send a message or move
+        something a person can see: the push, the batch, the retract, both resends, and the
+        WhatsApp erasure. ``POST /keys``, ``POST /webhook-endpoints`` and that endpoint's
+        ``/test`` accept a request without one — creating a second key or a second endpoint is
+        visible and undoable, so repeating it costs nobody a message or a credit.
+
+        Sending it on those three anyway is harmless, and the rule stays "every POST" rather than
+        a list because a list here would be a second copy of a decision the API already makes. The
+        failure mode of the broad rule is an ignored header; the failure mode of a stale list is a
+        push that goes out twice.
+
+        ``PUT`` and ``DELETE`` carry none and need none: they are idempotent by construction, so
+        setting a recipient's number twice leaves one number. Sending a message twice sends two
+        messages and charges two credits, which is the whole reason the header exists.
         """
         return self.method == "POST"
 
@@ -224,21 +227,43 @@ class Core:
         )
 
 
+_DELAY_SECONDS = re.compile(r"[0-9]{1,20}(\.[0-9]+)?")
+r"""The delta-seconds grammar this SDK accepts in a ``Retry-After``.
+
+ASCII digits, with an optional fractional part, and nothing else. Narrow on purpose: ``float()``
+would also read ``1e3`` as a thousand seconds, ``+5`` as five, and ``inf`` as a wait no policy can
+bound. None of those is a ``Retry-After`` a server means to send, and honouring them would let a
+malformed header choose how long a caller blocks.
+
+``[0-9]`` rather than ``\d``, which matches every Unicode decimal digit: ``float()`` reads those
+too, so ``\d`` would accept an Arabic-Indic five as five seconds.
+
+**The bound on the integer part keeps the result finite.** ``float()`` does not raise on a long
+run of digits, it returns ``inf``, and an ``inf`` reaching
+:attr:`~beaconbox.errors.APIError.retry_after` is a number a caller may hand to ``sleep()``. Twenty
+digits is already longer than any wait a server means to ask for.
+
+The *fraction* is deliberately unbounded. No number of digits after the point can overflow a float,
+so a limit there could only reject a precise value a server legitimately sent.
+"""
+
+
 def retry_after_seconds(headers: Mapping[str, str]) -> float | None:
     """``Retry-After`` in seconds, when the server sent a sane one.
 
     Only the delta-seconds form is honoured. The HTTP-date form is legal and essentially never
     used by an API, and parsing it would mean trusting the caller's clock to agree with the
     server's, which is the assumption that makes it worse than the SDK's own backoff.
+
+    A fractional value counts: a server that answers ``Retry-After: 1.5`` has said something more
+    precise than ``2``, and rounding it up is the SDK inventing a wait the server did not ask for.
     """
     value = _header(headers, "retry-after")
     if value is None:
         return None
-    try:
-        seconds = float(value.strip())
-    except ValueError:
+    if not _DELAY_SECONDS.fullmatch(value.strip()):
         return None
-    return seconds if seconds >= 0 else None
+    return float(value.strip())
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
@@ -275,9 +300,9 @@ def _validated_base_url(base_url: str) -> str:
 
     A **path** is allowed, for a deployment behind a gateway that mounts BeaconBox under a prefix.
     A **query string or fragment** is not: :meth:`Core.prepare` appends ``/api/v1/...`` and then
-    its own ``?``, so ``https://host?x=1`` silently produces ``https://host?x=1/api/v1/credits``
-    — a URL where the whole API path has become part of a query value. That request does not fail
-    loudly, it goes somewhere else, which is the worst shape a configuration mistake can take.
+    its own ``?``, so ``https://host?x=1`` would produce ``https://host?x=1/api/v1/credits``, a URL
+    where the whole API path has become part of a query value. Such a request does not fail loudly,
+    it goes somewhere else, which is the worst shape a configuration mistake can take.
     """
     cleaned = base_url.strip().rstrip("/")
     parts = urlsplit(cleaned)
@@ -286,8 +311,8 @@ def _validated_base_url(base_url: str) -> str:
     if not parts.netloc:
         raise ValueError(f"BeaconBox: base_url must include a host, got {base_url!r}")
     # The delimiters themselves, not `parts.query`/`parts.fragment`. Those are the empty string for
-    # a bare trailing `?` or `#`, which is falsy — and that URL is broken in exactly the same way:
-    # `https://host?` became `https://host?/api/v1/credits`, with the whole API path inside a query
+    # a bare trailing `?` or `#`, which is falsy, and that URL is broken in exactly the same way:
+    # `https://host?` yields `https://host?/api/v1/credits`, with the whole API path inside a query
     # value. A literal `?` or `#` has no legitimate place in a base URL, encoded or not.
     if "?" in cleaned or "#" in cleaned:
         raise ValueError(

@@ -98,6 +98,43 @@ class TestRejects:
         with pytest.raises(WebhookVerificationError):
             webhooks.verify(BODY, header, SECRET, now=NOW)
 
+    @pytest.mark.parametrize("digits", [21, 4301, 100_000])
+    def test_an_absurdly_long_timestamp_is_malformed_and_not_a_crash(self, digits: int) -> None:
+        """``int()`` raises ``ValueError`` past ``sys.get_int_max_str_digits()`` (4300 by default).
+
+        The value comes from a header anyone on the internet can write to a merchant's webhook
+        route, so an unbounded digit run escaped this function as a ``ValueError``, missed the
+        documented ``except WebhookVerificationError``, and turned the intended 400 into a 500 with
+        a stack trace. The pattern is length-bounded precisely so the conversion cannot raise.
+        """
+        header = f"t={'9' * digits},v1={'a' * 64}"
+
+        with pytest.raises(WebhookVerificationError, match="malformed"):
+            webhooks.verify(BODY, header, SECRET, now=NOW)
+
+    def test_the_longest_timestamp_it_accepts_is_still_handled(self) -> None:
+        """The boundary itself: twenty digits parses, and is then simply far outside tolerance."""
+        header = f"t={'9' * 20},v1={'a' * 64}"
+
+        with pytest.raises(WebhookVerificationError, match="seconds off"):
+            webhooks.verify(BODY, header, SECRET, now=NOW)
+
+    @pytest.mark.parametrize(
+        "timestamp",
+        [f"+{NOW}", f" {NOW} ", "1_700_000_000", "\u0661\u0667" + "\u0660" * 8],  # Arabic-Indic
+    )
+    def test_a_timestamp_only_int_would_accept_is_malformed(self, timestamp: str) -> None:
+        """``int()`` reads a leading sign, surrounding space, underscores and other scripts' digits.
+
+        The timestamp is inside the signed string, so each of those is an alternative spelling of
+        a header that has exactly one canonical form, and accepting them widens what counts as a
+        delivery for no gain.
+        """
+        header = f"t={timestamp},v1={'a' * 64}"
+
+        with pytest.raises(WebhookVerificationError, match="malformed"):
+            webhooks.verify(BODY, header, SECRET, now=NOW)
+
     @pytest.mark.parametrize(
         "signature",
         [
@@ -165,3 +202,35 @@ def test_comparison_is_constant_time() -> None:
 
     source = inspect.getsource(webhooks.verify)
     assert "hmac.compare_digest" in source
+
+
+class TestTheMismatchMessageIsActionable:
+    """**The error a merchant actually hits, and the one most likely to be misread.**
+
+    "Signature does not match" sounds like a key problem. The overwhelmingly common cause is not:
+    the bytes being checked are not the bytes that were sent, because something between the wire
+    and the check parsed and re-serialized the JSON. Found by using our own product — a body
+    copied out of a webhook inspector's "copy as curl" failed exactly this way, and the first
+    instinct was to go looking at the secret.
+    """
+
+    def test_a_reserialized_body_is_what_fails(self) -> None:
+        """The failure reproduced from its real cause, not from a corrupted byte. The re-serialized
+        body is *semantically identical* — same keys, same values, parses the same — and still
+        cannot verify, which is precisely why it is so confusing in the wild."""
+        reserialized = json.dumps(json.loads(BODY), indent=2).encode()
+        assert json.loads(reserialized) == json.loads(BODY), "must differ only in formatting"
+
+        with pytest.raises(WebhookVerificationError) as caught:
+            webhooks.verify(reserialized, sign(), SECRET, now=NOW)
+
+        assert "raw request bytes" in str(caught.value)
+
+    def test_the_message_names_the_likely_cause_before_the_secret(self) -> None:
+        """Ordering is the point: someone who reads "check your secret" first rotates a working
+        secret before thinking about the body."""
+        with pytest.raises(WebhookVerificationError) as caught:
+            webhooks.verify(b'{"tampered":true}', sign(), SECRET, now=NOW)
+
+        message = str(caught.value)
+        assert message.index("raw request bytes") < message.index("secret")

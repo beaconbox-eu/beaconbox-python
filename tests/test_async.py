@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -36,6 +37,7 @@ from tests.conftest import (
     PUSH_RESULT,
     Reply,
     make_async_client,
+    make_client,
     no_sleep,
 )
 
@@ -244,3 +246,125 @@ class TestPaginationCannotHang:
             [m async for m in client.messages.iterate(page_size=0)]
 
         assert recorder.requests == []
+
+
+#: The key the callers below pass explicitly, so a forwarded one can be told from a minted one.
+EXPLICIT_KEY = "k"
+
+# Every operation, as (name, how to call it). One list, driven against both clients, because the
+# async module is a hand-maintained mirror of the sync one and that is exactly the shape in which a
+# copy-paste error lives: `async def retract` calling `_ops.resend_sms` has the right signature,
+# the right return type and the wrong URL.
+OPERATIONS: list[tuple[str, Callable[[Any], Any]]] = [
+    ("messages.push", lambda c: c.messages.push(**PUSH, idempotency_key=EXPLICIT_KEY)),
+    (
+        "messages.push_batch",
+        lambda c: c.messages.push_batch([MessagePush(**PUSH)], idempotency_key=EXPLICIT_KEY),
+    ),
+    ("messages.get", lambda c: c.messages.get("m_1")),
+    ("messages.list", lambda c: c.messages.list(recipient_email="a@example.com", limit=7)),
+    ("messages.resend_sms", lambda c: c.messages.resend_sms("m_1", idempotency_key=EXPLICIT_KEY)),
+    (
+        "messages.resend_whatsapp",
+        lambda c: c.messages.resend_whatsapp("m_1", idempotency_key=EXPLICIT_KEY),
+    ),
+    ("messages.retract", lambda c: c.messages.retract("m_1", idempotency_key=EXPLICIT_KEY)),
+    ("credits.balance", lambda c: c.credits.balance()),
+    ("recipients.sms", lambda c: c.recipients.sms("buyer@example.com")),
+    ("recipients.set_phone", lambda c: c.recipients.set_phone("buyer@example.com", "+37255550134")),
+    ("recipients.clear_phone", lambda c: c.recipients.clear_phone("buyer@example.com")),
+    (
+        "recipients.erase_whatsapp",
+        lambda c: c.recipients.erase_whatsapp("buyer@example.com", idempotency_key=EXPLICIT_KEY),
+    ),
+    ("keys.list", lambda c: c.keys.list()),
+    ("keys.create", lambda c: c.keys.create("orders service", idempotency_key=EXPLICIT_KEY)),
+    ("keys.revoke", lambda c: c.keys.revoke("key_1")),
+    ("webhook_endpoints.list", lambda c: c.webhook_endpoints.list()),
+    (
+        "webhook_endpoints.create",
+        lambda c: c.webhook_endpoints.create(
+            "https://example.com/hooks", ["message.bounced"], "orders", idempotency_key=EXPLICIT_KEY
+        ),
+    ),
+    ("webhook_endpoints.test", lambda c: c.webhook_endpoints.test("we_1")),
+    ("webhook_endpoints.delete", lambda c: c.webhook_endpoints.delete("we_1")),
+]
+
+
+class TestEveryOperationIssuesTheSameRequestOnBothClients:
+    """The claim ``README`` makes as "same client, same signatures, awaited", checked on the wire.
+
+    :class:`TestParity` compares signatures, which cannot see inside a method body. These compare
+    the bytes: the method, the URL, the query string, the body and the ``Idempotency-Key``. An
+    async method wired to the wrong operation passes every signature check and fails here.
+
+    It is also what executes the async resource methods at all. Before this existed, fifteen of
+    the twenty went untouched by the suite while the sync twins were covered, so the half of the
+    advertised surface a merchant reaches with ``await`` was the half nobody ran.
+    """
+
+    def test_the_operation_list_covers_every_public_method(self) -> None:
+        """Otherwise this file grows a method and silently stops testing it."""
+        listed = {name for name, _ in OPERATIONS}
+        actual = {
+            f"{resource}.{method}"
+            for resource, cls in [
+                ("messages", resources.Messages),
+                ("credits", resources.Credits),
+                ("recipients", resources.Recipients),
+                ("keys", resources.Keys),
+                ("webhook_endpoints", resources.WebhookEndpoints),
+            ]
+            for method in public_methods(cls)
+        }
+        # `iterate` drives `list` in a loop and is covered by its own tests above.
+        assert actual - listed == {"messages.iterate"}, actual - listed
+
+    @pytest.mark.parametrize(("name", "call"), OPERATIONS, ids=[n for n, _ in OPERATIONS])
+    async def test_the_two_clients_send_identical_requests(
+        self, name: str, call: Callable[[Any], Any]
+    ) -> None:
+        reply = Reply(200, {"items": [], "id": "m_1", "next_cursor": None})
+
+        sync_client, sync_recorder = make_client(reply)
+        call(sync_client)
+
+        async_client, async_recorder = make_async_client(reply)
+        await call(async_client)
+
+        assert _shape(sync_recorder.only) == _shape(async_recorder.only), name
+
+    @pytest.mark.parametrize(("name", "call"), OPERATIONS, ids=[n for n, _ in OPERATIONS])
+    async def test_every_async_operation_reaches_the_network(
+        self, name: str, call: Callable[[Any], Any]
+    ) -> None:
+        """A method that returns without issuing a request is one nobody would notice was broken."""
+        client, recorder = make_async_client(
+            Reply(200, {"items": [], "id": "m_1", "next_cursor": None})
+        )
+
+        await call(client)
+
+        assert len(recorder.requests) == 1
+
+
+def _shape(request: httpx.Request) -> tuple[str, str, str, str | None, str | None]:
+    """What is worth comparing between the two clients, and nothing that cannot match.
+
+    The ``User-Agent`` is excluded because it names the client, which is the one header the two are
+    *supposed* to disagree about.
+
+    An ``Idempotency-Key`` the SDK minted is normalised to ``"<minted>"``, because it is a fresh
+    UUID per call: comparing the two clients' values would be comparing two random numbers. What
+    still has to match is the part that carries meaning, which is whether the header is there at
+    all and whether a key the caller supplied was forwarded rather than replaced.
+    """
+    key = request.headers.get("Idempotency-Key")
+    return (
+        request.method,
+        request.url.path,
+        str(request.url.query, "ascii"),
+        request.content.decode() or None,
+        key if key in (None, EXPLICIT_KEY) else "<minted>",
+    )

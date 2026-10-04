@@ -11,6 +11,9 @@ Python 3.10+. One runtime dependency, [httpx](https://www.python-httpx.org), whi
 only HTTP library where the sync and the async client share an API, so this SDK's logic is
 written once rather than twice.
 
+Full documentation, including the API reference and the guides this README summarises, is at
+[docs.beaconbox.eu](https://docs.beaconbox.eu/develop).
+
 ## Push an update
 
 ```python
@@ -80,13 +83,25 @@ if result.sms and result.sms.skipped_reason == SkipReason.INSUFFICIENT_CREDIT:
 **This SDK does not raise on a skip**, deliberately. Treating one as an error is what invites a
 retry, and a retry of a push that already succeeded is a second message to a real person.
 
-The **email** side answers the same question a step later, because that decision is made when the
-nudge runs rather than when you push:
+The **email** side answers in two halves, because the decision is made twice.
+
+`result.email` is the verdict as known at push time, so the stable, recipient-shaped reasons reach
+you in the response to the call you just made:
+
+```python
+if result.email and not result.email.sending:
+    # Reliable: no email will be sent, and skipped_reason says why.
+    print(result.email.skipped_reason)  # plan_lapsed, unsubscribed, suppressed, ...
+```
+
+**`sending=False` is reliable; `sending=True` is an expectation, not a promise.** At push time we
+can see a suppressed address or a lapsed plan; we cannot see the day's cap filling up between now
+and the send, or a pause applied in between. So for what actually happened, read the message back:
 
 ```python
 from beaconbox import EmailSkipReason
 
-message = client.messages.retrieve(result.id)
+message = client.messages.get(result.id)
 
 if message.delivery.not_sent:
     # No email was ever attempted, and none will be. Stop polling for delivery.
@@ -94,9 +109,9 @@ if message.delivery.not_sent:
         ...  # the subscription ran out; paying resumes sending
 ```
 
-`not_sent` is what tells `delivery.delivered is False` apart from itself — without it that flag
-meant both *on its way* and *never attempted*, so a loop waiting for delivery had nothing to stop
-on. It is `None` in the ordinary case, and a later successful send withdraws it.
+`not_sent` is what tells `delivery.delivered is False` apart from itself. On its own that flag
+covers both *on its way* and *never attempted*, which leaves a loop waiting for delivery nothing
+to stop on. It is `None` in the ordinary case, and a later successful send withdraws it.
 
 Compare `reason` as a string and treat an unrecognised value as "not sent": the server's list
 grows whenever a refusal is added to the send path, which is why this field is not typed as the
@@ -104,9 +119,13 @@ enum.
 
 ### 2. Idempotency is handled for you, and you can do better
 
-Every write carries an `Idempotency-Key`. This SDK generates one per call and **reuses it across
+Every `POST` carries an `Idempotency-Key`. This SDK generates one per call and **reuses it across
 its own retries**, so a connection that dies with the answer in flight cannot become a duplicate
 email and a duplicate charged SMS.
+
+`PUT` and `DELETE` do not carry one and do not need one: setting a recipient's number twice leaves
+one number. Sending a message twice sends two messages and charges two credits, which is the whole
+reason the header is mandatory on a push.
 
 Pass your own whenever you have a natural key:
 
@@ -151,7 +170,13 @@ client.credits.balance()
 
 # Keys and webhook endpoints
 client.keys.create("orders service")
-client.webhook_endpoints.create("https://example.com/hooks")  # empty list means every event
+endpoint = client.webhook_endpoints.create("https://example.com/hooks")  # empty = every event
+
+# Send one sample ping and see what came back. Always 200, whatever your endpoint answers:
+# the failure being reported belongs to the next hop, so read `delivered`, not the status.
+result = client.webhook_endpoints.test(endpoint.id)
+if not result.delivered:
+    print(result.status_code, result.error, f"{result.duration_ms}ms")
 ```
 
 ### Pay only for the customers the email did not reach
@@ -211,7 +236,7 @@ so a captured delivery cannot be replayed) and compares in constant time.
 Deliveries are **retried**, so the same `event.id` can arrive twice. Deduplicate on it.
 
 Two event types are worth wiring up before you need them. `MESSAGE_NOT_SENT` carries a `reason`
-and tells you an email was never attempted — the machine-readable half of the section above.
+and tells you an email was never attempted, the machine-readable half of the section above.
 `PLAN_LAPSED` means email sending has **stopped** for your account, and every nudge from then on
 produces a `MESSAGE_NOT_SENT` with reason `plan_lapsed` until the subscription is paid; it is the
 one to page on, and there is no way to learn it from your own side.
@@ -264,7 +289,7 @@ being absorbed is synchronised across every worker you run.
 
 **A `Retry-After` is honoured in full, not shortened to the backoff cap.** It is the server's own
 answer to when it will be ready, and retrying earlier only earns a second 429. Jitter is added *on
-top* of it rather than sampled from within it — the herd is at its worst here, because every worker
+top* of it rather than sampled from within it, because the herd is at its worst here: every worker
 that hit the same 429 was handed the same number.
 
 If the server asks for longer than `RetryPolicy.max_retry_after` (30s by default), the SDK **stops
@@ -275,8 +300,8 @@ cap and being refused anyway helps nobody; the number is what you need to schedu
 
 `max_connections` is a ceiling, and exceeding it does not look like one: the overflow queues for a
 free connection, and a queue wait that outlives the pool timeout surfaces as `APIConnectionError`
-rather than as anything mentioning a pool. If you fan out more concurrent calls than the ceiling —
-`asyncio.gather` over a few hundred pushes makes that easy — raise it to match.
+rather than as anything mentioning a pool. If you fan out more concurrent calls than the ceiling, and
+`asyncio.gather` over a few hundred pushes makes that easy, raise it to match.
 
 ## Logging
 
@@ -313,7 +338,7 @@ remembered to hide and the field added next year is not on it.
   your API key on the wire in clear.
 - **Redirects are never followed.** httpx would re-send the `Authorization` header to wherever a
   redirect points.
-- **An API key that cannot go in a header is refused at construction** — a control character, a
+- **An API key that cannot go in a header is refused at construction**: a control character, a
   newline or a non-ASCII character. A `\r\n` inside the key would reach the `Authorization`
   header. Surrounding whitespace is stripped, because a key read from a file keeps its trailing
   newline.
@@ -322,7 +347,7 @@ remembered to hide and the field added next year is not on it.
 - The key is never in a `repr`, and `NewApiKey.__repr__` redacts the minted key. Note that
   `dataclasses.asdict` and `.raw` still carry it: read the attribute, store it, drop the object.
 - Webhook signatures are compared in constant time, over a signed timestamp, and a malformed or
-  hostile signature value is a `WebhookVerificationError` rather than an unhandled exception — so
+  hostile signature value is a `WebhookVerificationError` rather than an unhandled exception, so
   the documented `except WebhookVerificationError` really does answer 400 to everything.
 
 Need a corporate CA bundle? Pass `verify=` a path or an `ssl.SSLContext`. Need a proxy or custom

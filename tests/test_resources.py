@@ -49,6 +49,44 @@ class TestPush:
             "kind": "one_off",
         }
 
+    def test_parses_the_email_block(self) -> None:
+        """Per-channel, which is the whole reason it is its own block: a bounce suppression must
+        never surface as an SMS reason, nor an SMS STOP as an email one."""
+        client, _ = make_client(
+            Reply(201, {**PUSH_RESULT, "email": {"sending": False, "skipped_reason": "suppressed"}})
+        )
+
+        result = client.messages.push(recipient_email="a@b.c", subject="s", body="b")
+
+        assert result.email is not None
+        assert result.email.sending is False
+        assert result.email.skipped_reason == "suppressed"
+
+    def test_email_block_is_none_when_nothing_was_nudged(self) -> None:
+        """``notify=False`` queues no email, so there is no email outcome. ``None`` rather than a
+        block saying "not sending": nothing was refused, nothing was asked for."""
+        client, _ = make_client(Reply(201, {**PUSH_RESULT, "email": None}))
+
+        result = client.messages.push(recipient_email="a@b.c", subject="s", body="b", notify=False)
+
+        assert result.email is None
+
+    def test_email_block_survives_a_reason_the_sdk_has_never_heard_of(self) -> None:
+        """The vocabulary grows server-side. An unknown reason must arrive intact rather than
+        raising or being dropped — a merchant branching on it can then treat it as "not sent",
+        which is what the API documents."""
+        client, _ = make_client(
+            Reply(
+                201,
+                {**PUSH_RESULT, "email": {"sending": False, "skipped_reason": "invented_later"}},
+            )
+        )
+
+        result = client.messages.push(recipient_email="a@b.c", subject="s", body="b")
+
+        assert result.email is not None
+        assert result.email.skipped_reason == "invented_later"
+
     def test_omits_optional_fields_rather_than_sending_null(self) -> None:
         """`notify=None` means "apply the default". `notify=false` actively suppresses a nudge.
         Sending null for the first would ask for the second."""
@@ -463,6 +501,54 @@ class TestWebhookEndpoints:
 
         client.webhook_endpoints.delete("we_1")
         assert recorder.only.method == "DELETE"
+
+    def test_test_reports_a_working_endpoint(self) -> None:
+        client, recorder = make_client(
+            Reply(200, {"delivered": True, "status_code": 200, "error": None, "duration_ms": 42})
+        )
+
+        result = client.webhook_endpoints.test("we_1")
+
+        assert recorder.only.method == "POST"
+        assert recorder.only.url.path.endswith("/webhook-endpoints/we_1/test")
+        assert result.delivered is True
+        assert result.status_code == 200
+        assert result.duration_ms == 42
+
+    def test_test_does_not_raise_when_the_receiver_is_broken(self) -> None:
+        """**The property that makes this usable.** The failure is at the caller's own server, so
+        a raise would describe the wrong hop — and a merchant debugging their handler would be
+        fighting an exception instead of reading a status code."""
+        client, _ = make_client(
+            Reply(
+                200,
+                {
+                    "delivered": False,
+                    "status_code": 500,
+                    "error": "The endpoint answered HTTP 500.",
+                    "duration_ms": 17,
+                },
+            )
+        )
+
+        result = client.webhook_endpoints.test("we_1")
+
+        assert result.delivered is False
+        assert result.status_code == 500
+        assert "500" in (result.error or "")
+
+    def test_test_reports_an_unreachable_endpoint(self) -> None:
+        client, _ = make_client(
+            Reply(
+                200,
+                {"delivered": False, "status_code": None, "error": "no route", "duration_ms": 0},
+            )
+        )
+
+        result = client.webhook_endpoints.test("we_1")
+
+        assert result.delivered is False
+        assert result.status_code is None
 
 
 class TestPaginationCannotHang:

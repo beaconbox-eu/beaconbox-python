@@ -27,6 +27,7 @@ from .models import (
     RetractResult,
     SmsOutcome,
     WebhookEndpoint,
+    WebhookTestResult,
     WhatsAppErasureReceipt,
     WhatsAppOutcome,
 )
@@ -39,17 +40,11 @@ DEFAULT_PAGE_SIZE = 50
 class _PageWalk:
     """Guards a cursor walk against a server that never finishes it.
 
-    Shared by the sync and the async ``iterate``, which is the point: the rule and the sentence
-    that explains it were written out twice, once per generator, and a safety check duplicated is
-    a safety check that gets improved in one copy.
+    Shared by the sync and the async ``iterate`` so the rule has one definition.
 
     A repeated cursor is a server bug. What makes it worth a client-side check is the shape it
-    takes in a merchant's process — a worker that never returns and a generator that never ends,
+    takes in a merchant's process: a worker that never returns and a generator that never ends,
     which is far harder to diagnose than an exception.
-
-    Private, and imported across modules the way :func:`_value` is. A caller has no reason to
-    construct one, and a name in ``resources.__all__`` that the package root does not re-export
-    would be public surface nobody documents.
     """
 
     __slots__ = ("_seen",)
@@ -230,8 +225,8 @@ class Messages(_Resource):
         status code.** One rejected item does not fail the batch, because a batch that aborted at
         item 7 would leave items 8 onwards unsent with nothing to say which.
 
-        Safe to retry: each item carries its own key derived from the batch's, so a retry after a
-        crash replays the items that already landed instead of pushing them again.
+        **Safe to retry with the same key.** Items that already went out are replayed rather than
+        sent a second time, including after a crash partway through the batch.
 
         .. code-block:: python
 
@@ -450,6 +445,24 @@ class WebhookEndpoints(_Resource):
             _ops.create_webhook_endpoint(url, [_value(t) for t in event_types], description),
             idempotency_key,
         )
+
+    def test(self, public_id: str) -> WebhookTestResult:
+        """Send one sample ``ping`` event to this endpoint and report what came back.
+
+        **The only way to find out your handler works before a real event depends on it.** A
+        wrong webhook fails silently by nature: your handler is simply never called, and nothing
+        on either side says so.
+
+        The event type is ``ping``, deliberately not a real one — a test carrying
+        ``message.delivered`` would be indistinguishable from the genuine article at your end. It
+        is signed exactly like a real delivery, so it also proves your signature verification.
+
+        Never raises for a failure at *your* end: read
+        :attr:`~beaconbox.models.WebhookTestResult.delivered`. Testing does not affect the
+        endpoint's health counters, so you can press it as often as you like while fixing a
+        handler.
+        """
+        return self._transport.invoke(_ops.test_webhook_endpoint(public_id))
 
     def delete(self, public_id: str) -> None:
         """Delete an endpoint. Deliveries already queued for it stop.

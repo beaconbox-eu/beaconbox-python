@@ -232,15 +232,12 @@ def coerce(enum_cls: type[_E], value: Any) -> _E | str:
 
     The fallback is the point. See the module docstring.
 
-    **Only ever a member or a ``str``**, which is what the fields built through this are annotated
-    as. It used to return ``value`` unchanged, so a JSON ``null`` in an enum field produced ``None``
-    and a number produced an ``int`` — both of them values the annotation said could not be there,
-    and both reached a caller who would compare them against a member and silently never match.
-    The declared return type is what now holds this to it; ``-> Any`` is why mypy could not.
+    **Only ever a member or a ``str``**, which is what every field built through this is annotated
+    as. A JSON ``null`` or a number in an enum field would otherwise reach a caller as a value the
+    annotation says cannot be there, to be compared against a member and silently never match.
 
     A non-string reads as the empty string rather than as its ``repr``: ``""`` is obviously absent
-    and testable, where ``"None"`` or ``"7"`` looks like a value the server sent. This also matches
-    the PHP SDK, whose ``Parse::enum`` has always taken the string first.
+    and testable, where ``"None"`` or ``"7"`` looks like a value the server sent.
     """
     if not isinstance(value, str):
         return ""
