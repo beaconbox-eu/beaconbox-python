@@ -74,6 +74,9 @@ def safe_extra(**fields: Any) -> dict[str, Any]:
       :attr:`~beaconbox._core.Call.route` is logged instead;
     * webhook secrets, and the payload of a webhook.
 
+    The response's ``X-Request-Id`` is logged as ``request_id``, because it is the value support
+    asks for and it says nothing about the request: the server mints it at random.
+
     The idempotency key is logged, because it is a random value of the caller's choosing that
     identifies one attempt, and correlating retries without it is guesswork. If a caller passes
     something identifying as their own key, that is their value in their logs.

@@ -24,7 +24,9 @@ from .enums import (
     ChannelSendStatus,
     MessageKind,
     MessageStatus,
+    OrderStatus,
     RecipientStatus,
+    SmsConsentSource,
     WebhookEventType,
     WhatsAppReplyForward,
     coerce,
@@ -37,6 +39,7 @@ __all__ = [
     "CreditBalance",
     "DeliveryStatus",
     "EmailOutcome",
+    "Failed",
     "Message",
     "MessagePage",
     "MessagePush",
@@ -44,6 +47,7 @@ __all__ = [
     "NewApiKey",
     "NewWebhookEndpoint",
     "NotSent",
+    "RecipientErasureReport",
     "RecipientSms",
     "RetractResult",
     "SmsDelivery",
@@ -270,8 +274,11 @@ class WhatsAppOutcome:
     credits: int
     skipped_reason: str | None = None
     sms_fallback: bool = False
-    """Whether an SMS is armed to follow if this WhatsApp message proves undeliverable. If it
-    fires it is a separate send with its own credit: poll the message to see it."""
+    """Whether an SMS is armed to follow if this WhatsApp message proves undeliverable, or
+    queued at once because WhatsApp cannot carry it (``not_reachable``, or ``template_not_sendable``
+    because the push lacks ``reference`` or ``order_status``, or the reference or business name
+    cannot be shown). Either way it is a separate send with its own credit: poll the message to
+    see it."""
     escalates_at: datetime | None = None
     raw: Payload = field(default_factory=dict, repr=False, compare=False)
 
@@ -349,7 +356,14 @@ class MessagePushResult:
     :attr:`whatsapp` because recording consent is not sending, and an account collecting consent
     ahead of switching the channel on has no :attr:`whatsapp` block at all."""
     reference: str | None = None
+    recipient_email: str | None = None
+    """The recipient this message was stored for, as BeaconBox normalised it (trimmed, lower
+    case). ``None`` only when an idempotent replay returns a response recorded before the API
+    started sending it."""
     raw: Payload = field(default_factory=dict, repr=False, compare=False)
+    order_status: OrderStatus | str | None = None
+    """The ``order_status`` the push carried, or ``None`` when it carried none. A value this SDK
+    does not know stays a plain string. Last, so positional construction is not shifted by it."""
 
     @classmethod
     def from_api(cls, payload: Payload) -> MessagePushResult:
@@ -357,6 +371,7 @@ class MessagePushResult:
         sms = payload.get("sms")
         whatsapp = payload.get("whatsapp")
         opt_in = payload.get("whatsapp_opt_in")
+        order_status = payload.get("order_status")
         return cls(
             id=_text(payload.get("id")),
             subject=_text(payload.get("subject")),
@@ -375,6 +390,10 @@ class MessagePushResult:
                 WhatsAppOptInOutcome.from_api(opt_in) if isinstance(opt_in, dict) else None
             ),
             reference=_opt_text(payload.get("reference")),
+            order_status=(
+                coerce(OrderStatus, order_status) if isinstance(order_status, str) else None
+            ),
+            recipient_email=_opt_text(payload.get("recipient_email")),
             raw=payload,
         )
 
@@ -406,11 +425,14 @@ class BatchItemResult:
 
 @dataclass(frozen=True)
 class BatchResult:
-    """What a batch returns. **Always HTTP 200: check :attr:`failed`, not the status code.**
+    """What a batch returns. **HTTP 200 whenever the batch is processed: check :attr:`failed`,
+    not the status code.**
 
     An item that failed is reported, not raised. One bad recipient must not discard the
     forty-nine good pushes alongside it, and a 4xx for the whole call would invite a retry of all
-    fifty.
+    fifty. The one refusal of the whole batch is a 409 ``idempotency.request_in_progress``, raised
+    as :class:`~beaconbox.errors.ConflictError` while the same key is still running it: retry the
+    whole batch later with the same key, and items already sent are replayed.
     """
 
     items: tuple[BatchItemResult, ...]
@@ -490,15 +512,48 @@ class NotSent:
 
 
 @dataclass(frozen=True)
+class Failed:
+    """Set when an email was attempted and BeaconBox has given up on it.
+
+    :class:`NotSent`'s counterpart at the other end of the send path. That one means BeaconBox
+    decided not to try; this one means it tried, and the email provider refused the message, every
+    retry failed, or the provider's answer was lost (``outcome_unknown``: it may still arrive, and
+    is never sent again). A caller polling for delivery can stop waiting, except on
+    ``outcome_unknown``: a later delivery clears this back to ``None`` and shows as delivered,
+    whatever its timestamp. ``None`` is the ordinary case.
+
+    :attr:`reason` is a plain string for the same reason :attr:`NotSent.reason` is. Compare against
+    :class:`~beaconbox.enums.EmailFailureReason` for the known values and treat anything else as
+    "failed".
+    """
+
+    reason: str
+    at: datetime | None = None
+    """When the send was given up on."""
+    raw: Payload = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, payload: Payload) -> Failed:
+        return cls(
+            reason=_text(payload.get("reason")),
+            at=_parse_datetime(payload.get("at")),
+            raw=payload,
+        )
+
+
+@dataclass(frozen=True)
 class DeliveryStatus:
     """A message's delivery state, derived from its events.
 
     ``opened`` is the one worth acting on: it is the difference between "we sent it" and "they
     have it", and it is what ``escalate_if_unread_after_minutes`` waits on.
 
-    ``not_sent`` is the one worth checking *before* you wait for any of them. Non-``None`` means
-    no email was ever attempted and none will be, so polling ``delivered`` for this message will
-    never terminate. See :class:`NotSent`.
+    ``not_sent`` and ``failed`` are the ones worth checking *before* you wait for any of them.
+    Non-``None`` ``not_sent`` means no email was ever attempted and none will be; non-``None``
+    ``failed`` means one was attempted and BeaconBox has given up on it. Either way stop polling
+    ``delivered`` for this message, unless ``failed.reason`` is ``outcome_unknown``: a delivery
+    can still arrive for that one, and clears ``failed``. See :class:`NotSent` and
+    :class:`Failed`.
     """
 
     delivered: bool
@@ -509,12 +564,14 @@ class DeliveryStatus:
     bounced_at: datetime | None = None
     sms: SmsDelivery | None = None
     not_sent: NotSent | None = None
+    failed: Failed | None = None
     raw: Payload = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, payload: Payload) -> DeliveryStatus:
         sms = payload.get("sms")
         not_sent = payload.get("not_sent")
+        failed = payload.get("failed")
         return cls(
             delivered=_flag(payload.get("delivered")),
             opened=_flag(payload.get("opened")),
@@ -524,6 +581,7 @@ class DeliveryStatus:
             bounced_at=_parse_datetime(payload.get("bounced_at")),
             sms=SmsDelivery.from_api(sms) if isinstance(sms, dict) else None,
             not_sent=NotSent.from_api(not_sent) if isinstance(not_sent, dict) else None,
+            failed=Failed.from_api(failed) if isinstance(failed, dict) else None,
             raw=payload,
         )
 
@@ -646,15 +704,27 @@ class RecipientSms:
     phone: str | None
     sms_status: RecipientStatus | str
     sms_status_at: datetime | None = None
+    sms_consent_at: datetime | None = None
+    """When a number was first accepted for texting this recipient. ``None`` for a recipient who
+    has never had one, or whose number predates the field. Not moved by a later number change, a
+    STOP or a START."""
+    sms_consent_source: SmsConsentSource | str | None = None
+    """The surface that first accepted it: ``push``, ``api``, ``admin`` or ``inbox`` (see
+    :class:`~beaconbox.enums.SmsConsentSource`), or ``None`` when no consent is on record."""
     raw: Payload = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, payload: Payload) -> RecipientSms:
+        source = payload.get("sms_consent_source")
         return cls(
             recipient_email=_text(payload.get("recipient_email")),
             phone=_opt_text(payload.get("phone")),
             sms_status=coerce(RecipientStatus, payload.get("sms_status")),
             sms_status_at=_parse_datetime(payload.get("sms_status_at")),
+            sms_consent_at=_parse_datetime(payload.get("sms_consent_at")),
+            sms_consent_source=(
+                coerce(SmsConsentSource, source) if isinstance(source, str) else None
+            ),
             raw=payload,
         )
 
@@ -706,6 +776,85 @@ class WhatsAppErasureReceipt:
 
 
 @dataclass(frozen=True)
+class RecipientErasureReport:
+    """What :meth:`~beaconbox.resources.Recipients.erase` removed from your records about one
+    recipient, as counts. **The erasure is not undoable.**
+
+    Counts only, never content: a report quoting what it deleted would be a fresh copy of it.
+
+    Two counts are of things **kept**, on purpose. :attr:`suppressions_kept` and :attr:`stops_kept`
+    are what stop this person being contacted again by a later push to the same address or number,
+    and an opt-out that is erased on request stops being one.
+
+    A repeat erasure, and an erasure of an address you never messaged, both answer with zeros. To
+    get the original counts back after a timed-out request, retry with the **same**
+    ``idempotency_key``.
+    """
+
+    messages_deleted: int
+    """Messages you sent them, subjects and bodies included."""
+    message_events_deleted: int
+    """Delivery, open and not-sent events about those messages."""
+    channel_sends_deleted: int
+    """SMS and WhatsApp send records, with the number they went to. Your credit ledger keeps its
+    entries; they no longer point at a send."""
+    message_links_deleted: int
+    """Links that opened one of those messages."""
+    whatsapp_replies_deleted: int
+    """WhatsApp replies they sent you, bodies included."""
+    webhook_payloads_scrubbed: int
+    """Webhook deliveries about this person whose address, subject, number or reply text was
+    replaced with null. A delivery still queued for your endpoint arrives with those fields
+    empty. Copies your endpoint already received are yours to delete."""
+    queued_jobs_cancelled: int
+    """Nudges, texts and escalations still waiting to go out for those messages, now cancelled."""
+    idempotency_records_deleted: int
+    """Stored API responses that named this recipient. Retrying one of those requests with its
+    original idempotency key runs it again rather than replaying it."""
+    audit_entries_pseudonymised: int
+    """Entries in your audit log about this recipient. They stay, because they record what your
+    staff did; the address in them is replaced by a keyed hash."""
+    subscription_deleted: bool
+    """Whether their recipient record (phone number, SMS and WhatsApp consent, unsubscribe state)
+    was deleted. ``False`` when there was none, for example on a repeat erasure."""
+    stops_kept: int
+    """SMS or WhatsApp opt-outs for their number that are kept, so nobody can text them again by
+    pushing to this address later."""
+    suppressions_kept: int
+    """Email suppressions (a hard bounce, a complaint, or their unsubscribe from you) for this
+    address that are kept, for the same reason."""
+    auto_reply_windows_dropped: int
+    """Rows holding their number so the automatic WhatsApp acknowledgement would not repeat."""
+    replies_a_forward_email_may_have_carried: int
+    """**Your remaining work.** An upper bound on erased WhatsApp replies that your reply-forward
+    email had already sent to your admin users' mailboxes. Those copies are outside anything
+    BeaconBox can reach: search your own mail for this recipient."""
+    raw: Payload = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, payload: Payload) -> RecipientErasureReport:
+        return cls(
+            messages_deleted=_number(payload.get("messages_deleted")),
+            message_events_deleted=_number(payload.get("message_events_deleted")),
+            channel_sends_deleted=_number(payload.get("channel_sends_deleted")),
+            message_links_deleted=_number(payload.get("message_links_deleted")),
+            whatsapp_replies_deleted=_number(payload.get("whatsapp_replies_deleted")),
+            webhook_payloads_scrubbed=_number(payload.get("webhook_payloads_scrubbed")),
+            queued_jobs_cancelled=_number(payload.get("queued_jobs_cancelled")),
+            idempotency_records_deleted=_number(payload.get("idempotency_records_deleted")),
+            audit_entries_pseudonymised=_number(payload.get("audit_entries_pseudonymised")),
+            subscription_deleted=_flag(payload.get("subscription_deleted")),
+            stops_kept=_number(payload.get("stops_kept")),
+            suppressions_kept=_number(payload.get("suppressions_kept")),
+            auto_reply_windows_dropped=_number(payload.get("auto_reply_windows_dropped")),
+            replies_a_forward_email_may_have_carried=_number(
+                payload.get("replies_a_forward_email_may_have_carried")
+            ),
+            raw=payload,
+        )
+
+
+@dataclass(frozen=True)
 class ApiKey:
     """A key as listed. ``masked`` is all that is ever shown after creation."""
 
@@ -714,6 +863,10 @@ class ApiKey:
     masked: str
     created: datetime
     raw: Payload = field(default_factory=dict, repr=False, compare=False)
+    minted_by: str | None = None
+    """The id of the key that created this one through the API, detached or not; ``None`` for a key
+    created in the dashboard (or by a server that predates the field). After a leak, a key still
+    listed with the leaked key's id here was created detached with it and is still live."""
 
     @classmethod
     def from_api(cls, payload: Payload) -> ApiKey:
@@ -723,6 +876,7 @@ class ApiKey:
             masked=_text(payload.get("masked")),
             created=_require_datetime(payload.get("created")),
             raw=payload,
+            minted_by=_opt_text(payload.get("minted_by")),
         )
 
 
@@ -874,7 +1028,9 @@ class MessagePush:
     of dictionaries has no field names an editor can complete or a type checker can check.
 
     Only ``recipient_email``, ``subject`` and ``body`` are required. See
-    :meth:`beaconbox.resources.Messages.push` for what each of the rest does.
+    :meth:`beaconbox.resources.Messages.push` for what each of the rest does, including
+    ``channels``, which can only narrow what your account settings allow and never switches a
+    channel on, and ``obsoletes``, which takes at most 100 ids of at most 64 characters each.
     """
 
     recipient_email: str
@@ -890,6 +1046,8 @@ class MessagePush:
     obsoletes: tuple[str, ...] = ()
     whatsapp_opt_in_source: str | None = None
     sms_if_whatsapp_fails: bool = False
+    # Last, so a caller passing the fields above positionally is not shifted by it.
+    order_status: OrderStatus | str | None = None
 
     def to_payload(self) -> Payload:
         """The request body, with unset optional fields left out entirely.
@@ -906,6 +1064,8 @@ class MessagePush:
         }
         if self.reference is not None:
             payload["reference"] = self.reference
+        if self.order_status is not None:
+            payload["order_status"] = _enum_value(self.order_status)
         if self.recipient_phone is not None:
             payload["recipient_phone"] = self.recipient_phone
         if self.channels is not None:
@@ -926,7 +1086,7 @@ class MessagePush:
 
 
 def _enum_value(value: Any) -> Any:
-    return value.value if isinstance(value, Channel | MessageKind) else value
+    return value.value if isinstance(value, Channel | MessageKind | OrderStatus) else value
 
 
 def _isoformat(value: datetime) -> str:

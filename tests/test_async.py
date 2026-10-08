@@ -25,6 +25,7 @@ from beaconbox import (
     BeaconBox,
     ConflictError,
     MessagePush,
+    OrderStatus,
     RetryPolicy,
     SkipReason,
     async_resources,
@@ -94,6 +95,13 @@ class TestOperations:
 
         assert recorder.only.method == "POST"
         assert result.id == "m_8sKq2Vd1"
+
+    async def test_push_sends_order_status(self) -> None:
+        client, recorder = make_async_client(Reply(201, PUSH_RESULT))
+
+        await client.messages.push(**PUSH, order_status=OrderStatus.CANCELLED)
+
+        assert recorder.body()["order_status"] == "cancelled"
 
     async def test_a_skipped_channel_does_not_raise_here_either(self) -> None:
         client, _ = make_async_client(Reply(201, PUSH_RESULT))
@@ -276,6 +284,10 @@ OPERATIONS: list[tuple[str, Callable[[Any], Any]]] = [
     (
         "recipients.erase_whatsapp",
         lambda c: c.recipients.erase_whatsapp("buyer@example.com", idempotency_key=EXPLICIT_KEY),
+    ),
+    (
+        "recipients.erase",
+        lambda c: c.recipients.erase("buyer@example.com", idempotency_key=EXPLICIT_KEY),
     ),
     ("keys.list", lambda c: c.keys.list()),
     ("keys.create", lambda c: c.keys.create("orders service", idempotency_key=EXPLICIT_KEY)),

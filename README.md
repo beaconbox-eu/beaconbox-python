@@ -17,7 +17,7 @@ Full documentation, including the API reference and the guides this README summa
 ## Push an update
 
 ```python
-from beaconbox import BeaconBox
+from beaconbox import BeaconBox, OrderStatus
 
 client = BeaconBox()  # reads BEACONBOX_API_KEY
 
@@ -26,6 +26,8 @@ result = client.messages.push(
     subject="Your order has shipped",
     body="Tracking XY123456789EE. Estimated delivery Thursday.",
     kind="updateable",
+    reference="#A-10294",
+    order_status=OrderStatus.SHIPPED,
 )
 
 print(result.id)  # 3xg39cvt8a46
@@ -36,7 +38,15 @@ account to create.
 
 Re-push the same `subject` with `kind="updateable"` to overwrite it in place, quietly. Add
 `notify=True` to force a nudge on an update, or `obsoletes=[...]` to grey out messages this one
-replaces.
+replaces (at most 100 ids, each at most 64 characters).
+
+Pass `reference` (your order number) and `order_status` (an `OrderStatus` such as
+`OrderStatus.SHIPPED`, or its string value) and BeaconBox writes the WhatsApp and SMS wording for
+you, for example "Your order #A-10294 from PhonicBloom has shipped." A WhatsApp nudge needs both:
+missing either, WhatsApp is skipped with `template_not_sendable` and nothing is charged.
+
+A request body may be at most 2 MiB, or 8 MiB for a batch. A larger one is refused with
+`InvalidRequestError` (HTTP 413, `request.too_large`) before it is read.
 
 ## Async
 
@@ -72,16 +82,41 @@ result = client.messages.push(
     recipient_phone="+37255550134",
     subject="Your order has shipped",
     body="Tracking XY123456789EE.",
+    reference="#A-10294",
+    order_status=OrderStatus.SHIPPED,
     channels=["sms"],
 )
 
 if result.sms and result.sms.skipped_reason == SkipReason.INSUFFICIENT_CREDIT:
     # Top up, then: client.messages.resend_sms(result.id)
     ...
+elif result.sms and result.sms.skipped_reason in (
+    SkipReason.SMS_DISABLED,  # your SMS mode is off
+    SkipReason.SMS_NOT_ENABLED,  # BeaconBox has not switched SMS on for you yet
+):
+    # The email went. Naming "sms" above did not, and cannot, turn SMS on.
+    ...
 ```
 
 **This SDK does not raise on a skip**, deliberately. Treating one as an error is what invites a
 retry, and a retry of a push that already succeeded is a second message to a real person.
+
+#### What `channels` means
+
+`channels` is a request that can only **narrow** what your account settings allow. It never
+switches a channel on:
+
+- Leave it unset and the push follows your account settings.
+- Leave a channel out of the list and this push does not use it (`disabled_by_request`).
+- Name a channel whose mode is `off` and nothing is sent on it (`sms_disabled`,
+  `whatsapp_disabled`). `off` is final.
+- Name a channel BeaconBox has not yet enabled for your business and nothing is sent on it
+  (`sms_not_enabled`, `whatsapp_not_enabled`). Ask for it from the dashboard.
+- A channel in `on_request` mode sends only on a push that names it.
+
+Naming a channel never overrides a country restriction or a recipient who opted out, and on
+WhatsApp never a recipient who did not opt in. A push that does not mention a channel your
+account has off, or sends only on request, gets no block for it at all (`result.sms is None`).
 
 The **email** side answers in two halves, because the decision is made twice.
 
@@ -107,11 +142,25 @@ if message.delivery.not_sent:
     # No email was ever attempted, and none will be. Stop polling for delivery.
     if message.delivery.not_sent.reason == EmailSkipReason.PLAN_LAPSED:
         ...  # the subscription ran out; paying resumes sending
+
+if message.delivery.failed:
+    # An email was attempted and BeaconBox gave up: esp_refused, retries_exhausted
+    # or outcome_unknown (the answer was lost; it may still arrive, which clears `failed`,
+    # and is never resent).
+    print(message.delivery.failed.reason, message.delivery.failed.at)
 ```
 
 `not_sent` is what tells `delivery.delivered is False` apart from itself. On its own that flag
 covers both *on its way* and *never attempted*, which leaves a loop waiting for delivery nothing
 to stop on. It is `None` in the ordinary case, and a later successful send withdraws it.
+`failed` is its counterpart at the other end of the send path: the email was tried, and the
+provider refused it, every retry failed, or (`outcome_unknown`) the provider's answer was lost,
+in which case it may still arrive: a later delivery clears `failed` (back to `None`) and shows as
+delivered, whatever its timestamp. Either one means stop waiting, unless an `outcome_unknown`
+delivery still matters to you.
+
+`daily_cap_reached` needs a resend: the nudge is not retried when the cap resets, so push again
+the next day if the update still matters.
 
 Compare `reason` as a string and treat an unrecognised value as "not sent": the server's list
 grows whenever a refusal is added to the send path, which is why this field is not typed as the
@@ -136,6 +185,10 @@ client.messages.push(..., idempotency_key="order-4711-shipped")
 Then a retry from *anywhere*, your queue, a cron, a human clicking twice, collapses onto the same
 key rather than only the retries this SDK makes internally.
 
+A key is at most 255 characters, and a **batch** key at most 252: each item's own key is the
+batch key with `#<index>` appended. A longer one is refused with `InvalidRequestError` before
+anything runs.
+
 ## Everything else
 
 ```python
@@ -151,7 +204,9 @@ for message in client.messages.iterate(recipient_email="buyer@example.com"):
 # Take one back: withdrawn for the recipient, any queued nudge called off, no credit spent
 client.messages.retract("3xg39cvt8a46")
 
-# Up to 100 pushes. Always 200: read result.failed, not the status code
+# Up to 100 pushes. Read result.failed, not the status code. A ConflictError
+# (idempotency.request_in_progress) means the same batch is still running: retry it with the same key
+# later. The SDK does not retry it for you, and items already sent are replayed rather than resent
 result = client.messages.push_batch(
     [
         MessagePush(recipient_email="a@example.com", subject="Shipped", body="..."),
@@ -162,6 +217,7 @@ for item in result.failures:
     print(item.index, item.error_code)
 
 # Contact details. Reads are masked: a leaked key must not dump a phone book
+client.recipients.sms("buyer@example.com").sms_consent_source  # push, api, admin or inbox
 client.recipients.set_phone("buyer@example.com", "+37255550134")
 client.recipients.clear_phone("buyer@example.com")
 
@@ -185,6 +241,16 @@ if not result.delivered:
 recipient still has not opened the message after that long, and if they open it first, nothing is
 sent and nothing is charged.
 
+- **The minutes count from the email**: from `send_at` when the message is scheduled, otherwise
+  from the push. If the email is still queued at the deadline, the deadline moves to that many
+  minutes after it goes.
+- **An email that bounced, failed or was skipped counts as unread**, so the paid channel is still
+  sent, subject to its own consent and settings. That is the case the paid channel exists for: the
+  email did not reach them. Only a push that queued no nudge at all (`notify=False`, or a quiet
+  in-place update) never escalates.
+- A channel in `on_request` mode that the push named still sends at the deadline.
+- `result.sms.escalates_at` (or `result.whatsapp.escalates_at`) says when the deadline falls.
+
 ```python
 client.messages.push(
     recipient_email="buyer@example.com",
@@ -196,9 +262,32 @@ client.messages.push(
 )
 ```
 
-### Erasing a recipient's WhatsApp history
+### Erasing a recipient
+
+`client.recipients.erase(email)` is the API half of an Article 17 request made to you, and it
+is **not undoable**. It deletes the messages you sent them, their delivery events, their SMS and
+WhatsApp send records, their WhatsApp replies and their recipient record (phone number, consent,
+unsubscribe state), scrubs them from webhook deliveries still queued for you, and cancels sends
+still waiting to go out.
+
+It **keeps** email suppressions for the address (an unsubscribe is kept as one) and SMS or WhatsApp
+opt-outs for their number, on purpose: those are what stop them being contacted again by a later
+push, and an opt-out erased on request stops being one. Erasing does not undo an unsubscribe: a
+later push to the address finds them still unsubscribed. The report counts both. A repeat erasure,
+or one of an address you never messaged, answers with zeros; retry a timed-out call with the same
+`idempotency_key` to get the original counts back.
+
+`client.recipients.erase_whatsapp(email)` removes only their WhatsApp history and withdraws
+WhatsApp consent.
+
+Both take the recipient's email address and nothing else. A blank value, or one that is not an
+address, raises `ValueError` before anything is sent (the API refuses it with a 422 anyway), so a
+slip in the value fails at your line.
 
 ```python
+report = client.recipients.erase("buyer@example.com")
+print(report.messages_deleted, report.suppressions_kept, report.stops_kept)
+
 receipt = client.recipients.erase_whatsapp("buyer@example.com")
 
 # The half only you can finish: erased replies whose words may already be in *your* mailboxes.
@@ -235,6 +324,13 @@ so a captured delivery cannot be replayed) and compares in constant time.
 
 Deliveries are **retried**, so the same `event.id` can arrive twice. Deduplicate on it.
 
+| Event | `event.data` |
+| --- | --- |
+| `message.delivered`, `message.opened`, `message.bounced`, `message.complained` | `message_id`, `recipient_email`, `subject`, `channel` (`"email"`) |
+| `message.not_sent` | the same, plus `reason` (an `EmailSkipReason` value): no email was attempted |
+| `message.failed` | the same, plus `reason` (`esp_refused`, `retries_exhausted` or `outcome_unknown`) when BeaconBox gave up on the send: an email was attempted and will not be retried. `outcome_unknown` means the provider's answer was lost, so it may still arrive: a `message.delivered` for the message supersedes it, in whichever order the two arrive |
+| `sms.delivered`, `sms.failed`, `sms.rejected`, and the same three for `whatsapp.*` | `message_id`, `recipient_phone` (masked), `country_code`, `credits_charged`, `channel`, `error_code`. Sent on the carrier's (or Meta's) report, and also when BeaconBox ends the send itself: refused at submit (`rejected`), an outcome never learned (`failed`, `*.submit_outcome_unknown`), or a send given up on after its retries (`failed`) |
+
 Two event types are worth wiring up before you need them. `MESSAGE_NOT_SENT` carries a `reason`
 and tells you an email was never attempted, the machine-readable half of the section above.
 `PLAN_LAPSED` means email sending has **stopped** for your account, and every nudge from then on
@@ -248,17 +344,42 @@ Everything inherits from `beaconbox.BeaconBoxError`.
 | Exception | When |
 | --- | --- |
 | `AuthenticationError` | 401, key missing, malformed or revoked |
-| `PermissionDeniedError` | 403 |
-| `InvalidRequestError` | 422, a malformed field, or a reused idempotency key with a different body |
+| `PermissionDeniedError` | 403, for example `plan.read_only` |
+| `InvalidRequestError` | 422, a malformed field, or a reused idempotency key with a different body. Also 413, a body over the size limit |
 | `ResourceMissingError` | 404, no such id. Also what another business's id looks like, deliberately |
-| `ConflictError` | 409, already sent, or an identical request still in flight |
+| `ConflictError` | 409, already sent, still queued, or an identical request still in flight |
 | `RateLimitError` | 429, after the SDK has already retried |
 | `ServerError` | 5xx, after the SDK has already retried |
 | `APIConnectionError` | no answer at all. **Not** proof the work did not happen |
 | `WebhookVerificationError` | a delivery could not be proven to be ours |
 
 Branch on `error.error_code` (a stable dotted string such as `message.not_found`), not on the
-message text.
+message text. Some worth knowing:
+
+| `error_code` | Status | Means |
+| --- | --- | --- |
+| `sms.already_sent`, `whatsapp.already_sent` | 409 | a resend while that channel's send is still queued, or after it went |
+| `whatsapp.escalated_to_sms` | 409 | a WhatsApp resend after `sms_if_whatsapp_fails` already texted them |
+| `sms.may_have_sent` | 409 | an SMS resend after an earlier text ended without the carrier's answer |
+| `whatsapp.may_have_sent` | 409 | a WhatsApp resend after an earlier message ended without Meta's answer |
+| `sms.phone_already_in_use` | 409 | the number belongs to another of your recipients |
+| `idempotency.request_in_progress` | 409 | the same key is still running; wait and retry with it |
+| `request.conflict` | 409 | two requests raced to write the same thing; a retry sees the winner |
+| `webhook.test_rate_limited` | 429 | `webhook_endpoints.test()` pressed too often |
+| `common.validation_failed` | 422 | a field is malformed or over a limit, for example more than 100 `obsoletes` |
+| `sms.phone_invalid` | 422 | `recipient_phone` or `recipients.set_phone()` got a number that does not parse or cannot be a recipient's phone: premium-rate, toll-free, shared-cost, voicemail, service, or a satellite or international code (+800, 808, 870, 878, 881, 882, 883, 888, 979). A number in those ranges stored earlier is skipped as `country_not_allowed` |
+| `request.too_large` | 413 | the body is over 2 MiB (8 MiB for a batch); refused before it is read |
+| `request.unstorable_input` | 422 | text holds a NUL character or a lone surrogate, which cannot be stored; the idempotency key is not spent |
+| `plan.read_only` | 403 | `keys.create()` while your plan has lapsed; pay, and it works again |
+
+A paid send that fails after the push reports its own code on the `sms.failed` or `whatsapp.failed`
+webhook as `data["error_code"]`. `sms.submit_outcome_unknown` and `whatsapp.submit_outcome_unknown`
+mean BeaconBox called the carrier (or Meta) and never learned the answer: the message may have
+arrived, so no second copy is sent and the charge stands. A WhatsApp one still falls back to SMS
+when `sms_if_whatsapp_fails` was set.
+
+**Every response carries an `X-Request-Id`.** It is on every exception as `error.request_id` and
+in its message. Quote it to support: it is the one value that finds your request in our logs.
 
 ## Configuration
 
@@ -324,7 +445,8 @@ Nothing is emitted at `INFO` or above in normal operation, so a `WARNING` from t
 means something went wrong.
 
 Each record carries a `beaconbox` attribute with structured fields (`route`, `attempt`,
-`status_code`, `elapsed_ms`, `idempotency_key`) for a JSON formatter.
+`status_code`, `elapsed_ms`, `idempotency_key`, `request_id`) for a JSON formatter. `request_id`
+is the response's `X-Request-Id`, the value to quote to support.
 
 **Nothing sensitive is ever logged.** Not the API key or any header, not request or response
 bodies, not the query string, and not the interpolated URL path. A route template is logged

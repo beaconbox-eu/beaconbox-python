@@ -75,6 +75,12 @@ class APIError(BeaconBoxError):
         self.error_code = error_code
         self.body: dict[str, Any] = body or {}
         self.request_id = request_id
+        """The ``X-Request-Id`` the API answered with, or ``None`` if the response carried none.
+
+        Every response carries one. **Quote it to support**: it is the one value that finds this
+        request in BeaconBox's logs. It is also in the exception message, so a logged exception
+        already has it.
+        """
 
         self.retry_after = retry_after
         """Seconds the server asked you to wait, from its ``Retry-After`` header, or ``None``.
@@ -90,7 +96,12 @@ class AuthenticationError(APIError):
 
 
 class PermissionDeniedError(APIError):
-    """403. The key is valid but not allowed to do this."""
+    """403. The key is valid but not allowed to do this.
+
+    ``plan.read_only`` is the one with a fix on your side: the plan has lapsed and the account is
+    read-only, so :meth:`~beaconbox.resources.Keys.create` is refused until the subscription is
+    paid.
+    """
 
 
 class ResourceMissingError(APIError):
@@ -104,6 +115,12 @@ class ResourceMissingError(APIError):
 class ConflictError(APIError):
     """409. Already sent, or an identical request is still in flight.
 
+    ``error_code`` says which: ``sms.already_sent``, ``whatsapp.already_sent`` or
+    ``whatsapp.escalated_to_sms`` on a resend; ``sms.phone_already_in_use`` when the number
+    belongs to another of your recipients; ``idempotency.request_in_progress`` while the same key
+    is still running; and ``request.conflict`` when two requests raced to write the same thing.
+    That last one is safe to retry: the retry sees what the other request wrote.
+
     Not retried by the SDK. "Your earlier attempt is still running" is a truthful answer to give
     a caller, and a client that quietly blocked for a second instead would be hiding it.
     """
@@ -111,11 +128,22 @@ class ConflictError(APIError):
 
 class InvalidRequestError(APIError):
     """422 (and any other 4xx). A malformed field, or an idempotency key reused with a
-    different body."""
+    different body.
+
+    Two codes are about the body as a whole rather than one field. ``request.too_large`` (413)
+    means it was over 2 MiB, or 8 MiB for a batch, and was refused before it was read.
+    ``request.unstorable_input`` (422) means some text in it cannot be stored: a NUL character or
+    a lone surrogate, usually from a binary value or a broken decode upstream. Neither is retried
+    by the SDK, because the same body is refused again; the idempotency key is not spent, so a
+    corrected request may reuse it.
+    """
 
 
 class RateLimitError(APIError):
     """429, after the SDK has already retried and backed off.
+
+    ``webhook.test_rate_limited`` is the per-business limit on
+    :meth:`~beaconbox.resources.WebhookEndpoints.test`: each press is a request to your server.
 
     **Check ``retry_after``.** A wait longer than the policy's ``max_retry_after`` is reported
     here rather than slept through, so this can arrive seconds after the call started with the

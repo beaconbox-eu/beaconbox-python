@@ -202,6 +202,33 @@ class TestWhatIsLogged:
         record = next(r for r in caplog.records if r.levelno == logging.WARNING)
         assert record.beaconbox["idempotency_key"] == "order-4711-shipped"  # type: ignore[attr-defined]
 
+    def test_the_response_log_carries_the_request_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The value support asks for, on the line an operator will be reading."""
+        client, _ = make_client(Reply(201, PUSH_RESULT, headers={"X-Request-Id": "9f1c2e"}))
+
+        with caplog.at_level(logging.DEBUG, logger="beaconbox"):
+            client.messages.push(**PUSH)
+
+        response = next(r for r in caplog.records if r.getMessage().startswith("response"))
+        assert response.beaconbox["request_id"] == "9f1c2e"  # type: ignore[attr-defined]
+
+    def test_the_retry_log_carries_the_request_id_of_the_answer_it_retried(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        no_sleep(monkeypatch)
+        client, _ = make_client(
+            [Reply(503, headers={"X-Request-Id": "first"}), Reply(201, PUSH_RESULT)],
+            retry_policy=RetryPolicy(max_retries=1),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="beaconbox"):
+            client.messages.push(**PUSH)
+
+        record = next(r for r in caplog.records if r.levelno == logging.WARNING)
+        assert record.beaconbox["request_id"] == "first"  # type: ignore[attr-defined]
+
     def test_giving_up_warns_once(
         self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:

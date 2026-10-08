@@ -19,7 +19,9 @@ from beaconbox import (
     ConflictError,
     MessageKind,
     MessagePush,
+    OrderStatus,
     ResourceMissingError,
+    RetryPolicy,
     SkipReason,
     async_resources,
 )
@@ -119,6 +121,44 @@ class TestPush:
         assert recorder.body()["kind"] == "updateable"
         assert recorder.body()["channels"] == ["sms"]
 
+    def test_order_status_accepts_the_enum_or_a_plain_string(self) -> None:
+        client, recorder = make_client([Reply(201, PUSH_RESULT), Reply(201, PUSH_RESULT)])
+
+        client.messages.push(
+            recipient_email="a@b.c",
+            subject="s",
+            body="b",
+            reference="#A-10294",
+            order_status=OrderStatus.SHIPPED,
+        )
+        client.messages.push(
+            recipient_email="a@b.c", subject="s", body="b", order_status="out_for_delivery"
+        )
+
+        assert recorder.body(0)["order_status"] == "shipped"
+        assert recorder.body(1)["order_status"] == "out_for_delivery"
+
+    def test_order_status_is_omitted_when_unset(self) -> None:
+        client, recorder = make_client(Reply(201, PUSH_RESULT))
+
+        client.messages.push(recipient_email="a@b.c", subject="s", body="b")
+
+        assert "order_status" not in recorder.body()
+
+    def test_a_batch_item_sends_its_order_status(self) -> None:
+        client, recorder = make_client(Reply(200, {"items": [], "succeeded": 0, "failed": 0}))
+
+        client.messages.push_batch(
+            [
+                MessagePush("a@b.c", "s", "b", order_status=OrderStatus.DELIVERED),
+                MessagePush("d@e.f", "s", "b"),
+            ]
+        )
+
+        items = recorder.body()["items"]
+        assert items[0]["order_status"] == "delivered"
+        assert "order_status" not in items[1]
+
     def test_whatsapp_opt_in_becomes_the_object_the_api_requires(self) -> None:
         """The API refuses a bare boolean on purpose: a copied `true` is not evidence of
         anything, and the source has to be a surface the merchant authored."""
@@ -142,6 +182,29 @@ class TestPush:
         assert result.sms is not None
         assert result.sms.queued is False
         assert result.sms.skipped_reason == SkipReason.INSUFFICIENT_CREDIT
+
+    @pytest.mark.parametrize("reason", ["sms_disabled", "sms_not_enabled"])
+    def test_naming_a_channel_cannot_switch_it_on(self, reason: str) -> None:
+        """``channels=["sms"]`` on an account with SMS off, or not enabled yet, is still a 201 and
+        reports the reason rather than raising."""
+        client, recorder = make_client(
+            Reply(
+                201,
+                {**PUSH_RESULT, "sms": {"queued": False, "credits": 0, "skipped_reason": reason}},
+            )
+        )
+
+        result = client.messages.push(
+            recipient_email="buyer@example.com",
+            subject="Shipped",
+            body="Tracking XY123456789EE.",
+            channels=["sms"],
+        )
+
+        assert recorder.body()["channels"] == ["sms"]
+        assert result.sms is not None
+        assert result.sms.queued is False
+        assert result.sms.skipped_reason in (SkipReason.SMS_DISABLED, SkipReason.SMS_NOT_ENABLED)
 
 
 class TestBatch:
@@ -189,6 +252,26 @@ class TestBatch:
 
         client.messages.push_batch([], idempotency_key="nightly-2026-08-20")
 
+        assert recorder.only.headers["Idempotency-Key"] == "nightly-2026-08-20"
+
+    def test_a_batch_still_running_under_the_key_raises_and_is_not_retried(self) -> None:
+        """The whole batch's 409, never an item's result. Retrying it inside the SDK would only
+        hit the same live run, so it is the caller's to retry later with the same key."""
+        client, recorder = make_client(
+            [
+                Reply(409, {"error_code": "idempotency.request_in_progress"}),
+                Reply(200, {"items": [], "succeeded": 0, "failed": 0}),
+            ],
+            retry_policy=RetryPolicy(max_retries=3, base_delay=0, max_delay=0),
+        )
+
+        with pytest.raises(ConflictError) as caught:
+            client.messages.push_batch(
+                [MessagePush(recipient_email="a@b.c", subject="s", body="b")],
+                idempotency_key="nightly-2026-08-20",
+            )
+
+        assert caught.value.error_code == "idempotency.request_in_progress"
         assert recorder.only.headers["Idempotency-Key"] == "nightly-2026-08-20"
 
 
@@ -271,6 +354,21 @@ class TestMessageWrites:
 
         with pytest.raises(ConflictError):
             client.messages.resend_sms("m_8sKq2Vd1")
+
+    def test_resend_while_a_send_is_still_queued_is_a_conflict(self) -> None:
+        client, _ = make_client(
+            Reply(
+                409,
+                {"error_code": "sms.already_sent", "detail": "already queued"},
+                headers={"X-Request-Id": "abc123"},
+            )
+        )
+
+        with pytest.raises(ConflictError) as caught:
+            client.messages.resend_sms("m_1")
+
+        assert caught.value.error_code == "sms.already_sent"
+        assert caught.value.request_id == "abc123"
 
     def test_resend_whatsapp(self) -> None:
         client, recorder = make_client(
@@ -390,6 +488,79 @@ class TestRecipients:
         assert receipt.consent_withdrawn is True
         assert receipt.replies_a_forward_email_may_have_carried == 3
 
+    def test_erase_posts_with_a_key_and_returns_the_report(self) -> None:
+        client, recorder = make_client(
+            Reply(
+                200,
+                {
+                    "messages_deleted": 2,
+                    "message_events_deleted": 5,
+                    "channel_sends_deleted": 1,
+                    "message_links_deleted": 2,
+                    "whatsapp_replies_deleted": 0,
+                    "webhook_payloads_scrubbed": 1,
+                    "queued_jobs_cancelled": 0,
+                    "idempotency_records_deleted": 2,
+                    "audit_entries_pseudonymised": 1,
+                    "subscription_deleted": True,
+                    "stops_kept": 1,
+                    "suppressions_kept": 0,
+                    "auto_reply_windows_dropped": 0,
+                    "replies_a_forward_email_may_have_carried": 0,
+                },
+            )
+        )
+
+        report = client.recipients.erase("buyer+tag@example.com")
+
+        assert recorder.only.method == "POST"
+        assert str(recorder.only.url).endswith("/recipients/buyer%2Btag%40example.com/erase")
+        assert recorder.only.headers.get("Idempotency-Key")
+        assert report.messages_deleted == 2
+        assert report.stops_kept == 1
+        assert report.subscription_deleted is True
+
+    def test_erase_forwards_a_caller_key(self) -> None:
+        """Retrying with the same key is how a timed-out erasure gets its original counts back."""
+        client, recorder = make_client(Reply(200, {}))
+
+        client.recipients.erase("buyer@example.com", idempotency_key="erase-buyer-1")
+
+        assert recorder.only.headers["Idempotency-Key"] == "erase-buyer-1"
+
+    def test_erase_cannot_be_steered_to_another_route(self) -> None:
+        client, recorder = make_client(Reply(200, {}))
+
+        client.recipients.erase("a/../../keys@example.com")
+
+        assert recorder.only.url.raw_path.decode().endswith(
+            "/recipients/a%2F..%2F..%2Fkeys%40example.com/erase"
+        )
+
+    @pytest.mark.parametrize(
+        "email",
+        ["", "   ", "buyer", "@example.com", "buyer@", "buyer@localhost", "a b@example.com"],
+    )
+    @pytest.mark.parametrize("method", ["erase", "erase_whatsapp"])
+    def test_erase_refuses_a_value_that_is_not_an_address(self, method: str, email: str) -> None:
+        """The API answers 422 for these anyway. An erasure is the call where a slip should fail
+        at the caller's line, before anything is sent."""
+        client, recorder = make_client(Reply(200, {}))
+
+        with pytest.raises(ValueError, match="email address") as caught:
+            getattr(client.recipients, method)(email)
+
+        assert recorder.requests == []
+        if email.strip():
+            assert email not in str(caught.value)
+
+    def test_erase_trims_surrounding_whitespace(self) -> None:
+        client, recorder = make_client(Reply(200, {}))
+
+        client.recipients.erase(" buyer@example.com\n")
+
+        assert str(recorder.only.url).endswith("/recipients/buyer%40example.com/erase")
+
 
 class TestKeys:
     def test_list_unwraps_items(self) -> None:
@@ -413,6 +584,29 @@ class TestKeys:
 
         assert len(keys) == 1
         assert keys[0].id == "k_1"
+        assert keys[0].minted_by is None
+
+    def test_list_carries_the_minting_key(self) -> None:
+        client, _ = make_client(
+            Reply(
+                200,
+                {
+                    "items": [
+                        {
+                            "id": "k_2",
+                            "name": "planted",
+                            "masked": "bbx_live_••••••••abcd",
+                            "created": "2026-08-01T00:00:00Z",
+                            "minted_by": "k_1",
+                        }
+                    ]
+                },
+            )
+        )
+
+        (key,) = client.keys.list()
+
+        assert key.minted_by == "k_1"
 
     def test_create(self) -> None:
         client, recorder = make_client(
@@ -435,6 +629,20 @@ class TestKeys:
         # The id is what `revoke` takes. Without it a caller had to list and match on `name`, which
         # is ambiguous: a name is not unique and defaults to "Untitled key".
         assert key.id == "k_7Hq2"
+
+    def test_detach_is_sent_only_when_asked_for(self) -> None:
+        reply = {
+            "id": "k_8",
+            "name": "rotation",
+            "key": "bbx_live_new",
+            "masked": "bbx_live_••••••••_new",
+            "created": "2026-10-07T00:00:00Z",
+        }
+        client, recorder = make_client(Reply(201, reply))
+
+        client.keys.create("rotation", detach=True)
+
+        assert json.loads(recorder.only.content) == {"name": "rotation", "detach": True}
 
     def test_revoke_handles_a_204(self) -> None:
         client, recorder = make_client(Reply(204))

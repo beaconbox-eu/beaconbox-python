@@ -9,23 +9,31 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
+from typing import ClassVar
 
 import pytest
 
 from beaconbox import (
+    BatchResult,
     DeliveryStatus,
+    EmailFailureReason,
     EmailSkipReason,
     MessageKind,
     MessagePush,
     MessagePushResult,
     MessageStatus,
+    OrderStatus,
+    RecipientErasureReport,
     RecipientSms,
     RecipientStatus,
     SkipReason,
+    SmsConsentSource,
     SmsOutcome,
     WebhookEndpoint,
     WebhookEvent,
+    WebhookEventType,
     WebhookTestResult,
+    WhatsAppOutcome,
 )
 from beaconbox.models import _parse_datetime
 from tests.conftest import MESSAGE_VIEW, PUSH_RESULT
@@ -288,6 +296,7 @@ class TestMessagePushPayload:
             body="Tracking XY123456789EE.",
             kind=MessageKind.UPDATEABLE,
             reference="#A-10294",
+            order_status=OrderStatus.SHIPPED,
             recipient_phone="+37255550134",
             channels=("sms", "whatsapp"),
             notify=True,
@@ -304,6 +313,7 @@ class TestMessagePushPayload:
             "body",
             "kind",
             "reference",
+            "order_status",
             "recipient_phone",
             "channels",
             "notify",
@@ -314,6 +324,7 @@ class TestMessagePushPayload:
             "sms_if_whatsapp_fails",
         }
         assert payload["reference"] == "#A-10294"
+        assert payload["order_status"] == "shipped"
         assert payload["recipient_phone"] == "+37255550134"
         assert payload["channels"] == ["sms", "whatsapp"]
         assert payload["obsoletes"] == ["m_1", "m_2"]
@@ -454,6 +465,259 @@ class TestNotSent:
         # what mypy's ``--strict-equality`` rejects as non-overlapping, and it is right to: the
         # member is what a caller compares *to*, not what they compare.
         assert EmailSkipReason.DAILY_CAP_REACHED.value == "daily_cap_reached"
+
+
+class TestFailed:
+    """``delivery.failed``: ``not_sent``'s counterpart for an email that was tried and lost."""
+
+    def test_absent_is_none(self) -> None:
+        delivery = DeliveryStatus.from_api({"delivered": False, "opened": False, "bounced": False})
+        assert delivery.failed is None
+
+    def test_a_failure_carries_its_reason_and_time(self) -> None:
+        delivery = DeliveryStatus.from_api(
+            {
+                "delivered": False,
+                "opened": False,
+                "bounced": False,
+                "not_sent": None,
+                "failed": {"reason": "esp_refused", "at": "2026-10-07T08:00:00Z"},
+            }
+        )
+        assert delivery.not_sent is None
+        assert delivery.failed is not None
+        assert delivery.failed.reason == EmailFailureReason.ESP_REFUSED
+        assert delivery.failed.at == datetime(2026, 10, 7, 8, 0, tzinfo=timezone.utc)
+        assert delivery.failed.raw == {"reason": "esp_refused", "at": "2026-10-07T08:00:00Z"}
+
+    def test_an_unknown_reason_parses_rather_than_raising(self) -> None:
+        delivery = DeliveryStatus.from_api(
+            {
+                "delivered": False,
+                "opened": False,
+                "bounced": False,
+                "failed": {"reason": "provider_on_fire", "at": "not a date"},
+            }
+        )
+        assert delivery.failed is not None
+        assert delivery.failed.reason == "provider_on_fire"
+        assert delivery.failed.at is None
+
+    @pytest.mark.parametrize("value", [None, "esp_refused", 7, []])
+    def test_a_failed_field_that_is_not_an_object_reads_as_absent(self, value: object) -> None:
+        delivery = DeliveryStatus.from_api(
+            {"delivered": False, "opened": False, "bounced": False, "failed": value}
+        )
+        assert delivery.failed is None
+
+    def test_the_enums_carry_the_wire_values(self) -> None:
+        assert EmailFailureReason.RETRIES_EXHAUSTED.value == "retries_exhausted"
+        assert EmailFailureReason.OUTCOME_UNKNOWN.value == "outcome_unknown"
+        assert EmailSkipReason.BUSINESS_INACTIVE.value == "business_inactive"
+        assert WebhookEventType.MESSAGE_FAILED.value == "message.failed"
+
+
+class TestPushResultRecipientEmail:
+    def test_reads_the_normalised_address(self) -> None:
+        result = MessagePushResult.from_api({**PUSH_RESULT, "recipient_email": "buyer@example.com"})
+        assert result.recipient_email == "buyer@example.com"
+
+    @pytest.mark.parametrize("value", [None, 7])
+    def test_absent_or_malformed_reads_as_none(self, value: object) -> None:
+        """A replay of a response recorded before the field existed carries null."""
+        assert MessagePushResult.from_api(PUSH_RESULT).recipient_email is None
+        payload = {**PUSH_RESULT, "recipient_email": value}
+        assert MessagePushResult.from_api(payload).recipient_email is None
+
+    def test_a_batch_item_carries_it_too(self) -> None:
+        batch = BatchResult.from_api(
+            {
+                "items": [
+                    {
+                        "index": 0,
+                        "ok": True,
+                        "result": {**PUSH_RESULT, "recipient_email": "a@example.com"},
+                    }
+                ],
+                "succeeded": 1,
+                "failed": 0,
+            }
+        )
+        assert batch.items[0].result is not None
+        assert batch.items[0].result.recipient_email == "a@example.com"
+
+
+class TestOrderStatus:
+    def test_the_enum_serialises_to_its_value(self) -> None:
+        payload = MessagePush(
+            recipient_email="a@b.c", subject="s", body="b", order_status=OrderStatus.SHIPPED
+        ).to_payload()
+        assert payload["order_status"] == "shipped"
+        assert type(payload["order_status"]) is str
+
+    def test_a_plain_string_passes_through(self) -> None:
+        """So a status the API adds later can be sent before this SDK knows it."""
+        payload = MessagePush(
+            recipient_email="a@b.c", subject="s", body="b", order_status="out_for_delivery"
+        ).to_payload()
+        assert payload["order_status"] == "out_for_delivery"
+
+    def test_unset_is_omitted(self) -> None:
+        payload = MessagePush(recipient_email="a@b.c", subject="s", body="b").to_payload()
+        assert "order_status" not in payload
+
+    def test_the_known_values_in_order(self) -> None:
+        assert [status.value for status in OrderStatus] == [
+            "confirmed",
+            "shipped",
+            "ready_for_pickup",
+            "delivered",
+            "cancelled",
+            "refunded",
+            "delayed",
+        ]
+
+    def test_a_known_value_reads_back_as_the_enum(self) -> None:
+        result = MessagePushResult.from_api({**PUSH_RESULT, "order_status": "ready_for_pickup"})
+        assert result.order_status is OrderStatus.READY_FOR_PICKUP
+
+    def test_an_unknown_value_stays_a_plain_string(self) -> None:
+        """The list grows on the server. A status this SDK has not heard of must not raise."""
+        result = MessagePushResult.from_api({**PUSH_RESULT, "order_status": "out_for_delivery"})
+        assert result.order_status == "out_for_delivery"
+        assert not isinstance(result.order_status, OrderStatus)
+
+    @pytest.mark.parametrize("value", [None, 7])
+    def test_absent_null_or_malformed_reads_as_none(self, value: object) -> None:
+        assert MessagePushResult.from_api(PUSH_RESULT).order_status is None
+        payload = {**PUSH_RESULT, "order_status": value}
+        assert MessagePushResult.from_api(payload).order_status is None
+
+    def test_a_batch_item_carries_it_too(self) -> None:
+        batch = BatchResult.from_api(
+            {
+                "items": [
+                    {"index": 0, "ok": True, "result": {**PUSH_RESULT, "order_status": "shipped"}}
+                ],
+                "succeeded": 1,
+                "failed": 0,
+            }
+        )
+        assert batch.items[0].result is not None
+        assert batch.items[0].result.order_status is OrderStatus.SHIPPED
+
+
+class TestRecipientSmsConsent:
+    BASE: ClassVar[dict[str, object]] = {
+        "recipient_email": "buyer@example.com",
+        "phone": "+372 •••• 0134",
+        "sms_status": "active",
+        "sms_status_at": "2026-08-20T09:00:00Z",
+    }
+
+    def test_reads_when_and_where_consent_began(self) -> None:
+        recipient = RecipientSms.from_api(
+            {**self.BASE, "sms_consent_at": "2026-08-01T12:00:00Z", "sms_consent_source": "push"}
+        )
+        assert recipient.sms_consent_at == datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+        assert recipient.sms_consent_source is SmsConsentSource.PUSH
+
+    def test_absent_reads_as_none(self) -> None:
+        """An older API, or a number that predates the field."""
+        recipient = RecipientSms.from_api(self.BASE)
+        assert recipient.sms_consent_at is None
+        assert recipient.sms_consent_source is None
+
+    def test_null_source_stays_none_rather_than_an_empty_string(self) -> None:
+        recipient = RecipientSms.from_api({**self.BASE, "sms_consent_source": None})
+        assert recipient.sms_consent_source is None
+
+    def test_an_unknown_source_falls_back_to_the_string(self) -> None:
+        recipient = RecipientSms.from_api({**self.BASE, "sms_consent_source": "kiosk"})
+        assert recipient.sms_consent_source == "kiosk"
+
+    def test_the_enum_carries_the_wire_values(self) -> None:
+        assert [s.value for s in SmsConsentSource] == ["push", "api", "admin", "inbox"]
+
+
+class TestNewSkipReasons:
+    """The reasons that make ``channels`` a request that can only narrow."""
+
+    @pytest.mark.parametrize(
+        ("wire", "member"),
+        [
+            ("sms_not_enabled", SkipReason.SMS_NOT_ENABLED),
+            ("sms_warmup_cap_reached", SkipReason.SMS_WARMUP_CAP_REACHED),
+            ("sms_disabled", SkipReason.SMS_DISABLED),
+        ],
+    )
+    def test_sms_reasons_compare_equal_to_their_members(
+        self, wire: str, member: SkipReason
+    ) -> None:
+        outcome = SmsOutcome.from_api({"queued": False, "credits": 1, "skipped_reason": wire})
+        assert outcome.skipped_reason == member
+
+    def test_whatsapp_not_enabled(self) -> None:
+        outcome = WhatsAppOutcome.from_api(
+            {"queued": False, "credits": 1, "skipped_reason": "whatsapp_not_enabled"}
+        )
+        assert outcome.skipped_reason == SkipReason.WHATSAPP_NOT_ENABLED
+
+    def test_a_reason_added_after_this_sdk_still_parses(self) -> None:
+        outcome = SmsOutcome.from_api(
+            {"queued": False, "credits": 1, "skipped_reason": "sms_reason_from_2027"}
+        )
+        assert outcome.skipped_reason == "sms_reason_from_2027"
+
+    def test_a_resend_outcome_without_a_skipped_reason_is_queued(self) -> None:
+        """``skipped_reason`` is optional on the resend response and absent when it went."""
+        outcome = SmsOutcome.from_api({"queued": True, "credits": 1})
+        assert outcome.queued is True
+        assert outcome.skipped_reason is None
+
+
+class TestRecipientErasureReport:
+    FULL: ClassVar[dict[str, object]] = {
+        "messages_deleted": 3,
+        "message_events_deleted": 9,
+        "channel_sends_deleted": 2,
+        "message_links_deleted": 3,
+        "whatsapp_replies_deleted": 1,
+        "webhook_payloads_scrubbed": 4,
+        "queued_jobs_cancelled": 1,
+        "idempotency_records_deleted": 5,
+        "audit_entries_pseudonymised": 2,
+        "subscription_deleted": True,
+        "stops_kept": 1,
+        "suppressions_kept": 1,
+        "auto_reply_windows_dropped": 1,
+        "replies_a_forward_email_may_have_carried": 1,
+    }
+
+    def test_every_count_is_read(self) -> None:
+        report = RecipientErasureReport.from_api(self.FULL)
+        assert report.messages_deleted == 3
+        assert report.message_events_deleted == 9
+        assert report.channel_sends_deleted == 2
+        assert report.message_links_deleted == 3
+        assert report.whatsapp_replies_deleted == 1
+        assert report.webhook_payloads_scrubbed == 4
+        assert report.queued_jobs_cancelled == 1
+        assert report.idempotency_records_deleted == 5
+        assert report.audit_entries_pseudonymised == 2
+        assert report.subscription_deleted is True
+        assert report.stops_kept == 1
+        assert report.suppressions_kept == 1
+        assert report.auto_reply_windows_dropped == 1
+        assert report.replies_a_forward_email_may_have_carried == 1
+        assert report.raw == self.FULL
+
+    def test_a_repeat_erasure_reads_as_zeros(self) -> None:
+        """An empty or partial body is tolerated, not raised on: zeros and ``False``."""
+        report = RecipientErasureReport.from_api({"messages_deleted": None, "future_count": 7})
+        assert report.messages_deleted == 0
+        assert report.subscription_deleted is False
+        assert report.raw["future_count"] == 7
 
 
 class TestWebhookTestResultStatusCode:

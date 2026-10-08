@@ -28,6 +28,7 @@ from beaconbox import (
     InvalidRequestError,
     MessageKind,
     MessagePush,
+    OrderStatus,
 )
 
 # Long enough for a push to be sent and the provider's delivery webhook to make the round trip.
@@ -92,6 +93,7 @@ def main() -> int:
         subject=f"Order #{run} is on its way",
         body="Your order shipped today. Tracking: XX000000000XX.",
         reference=f"#{run}",
+        order_status=OrderStatus.SHIPPED,
     )
     check(
         "push accepted",

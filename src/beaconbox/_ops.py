@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from ._core import Call, path_segment
+from ._core import Call, erasable_address, path_segment
 from .models import (
     ApiKey,
     BatchResult,
@@ -24,6 +24,7 @@ from .models import (
     MessagePushResult,
     NewApiKey,
     NewWebhookEndpoint,
+    RecipientErasureReport,
     RecipientSms,
     RetractResult,
     SmsOutcome,
@@ -148,9 +149,18 @@ def clear_recipient_phone(email: str) -> Call[RecipientSms]:
 def erase_whatsapp(email: str) -> Call[WhatsAppErasureReceipt]:
     return Call(
         "POST",
-        f"/recipients/{path_segment(email)}/whatsapp/erase",
+        f"/recipients/{path_segment(erasable_address(email))}/whatsapp/erase",
         WhatsAppErasureReceipt.from_api,
         route="/recipients/{email}/whatsapp/erase",
+    )
+
+
+def erase_recipient(email: str) -> Call[RecipientErasureReport]:
+    return Call(
+        "POST",
+        f"/recipients/{path_segment(erasable_address(email))}/erase",
+        RecipientErasureReport.from_api,
+        route="/recipients/{email}/erase",
     )
 
 
@@ -161,8 +171,12 @@ def list_keys() -> Call[tuple[ApiKey, ...]]:
     return Call("GET", "/keys", _keys)
 
 
-def create_key(name: str | None) -> Call[NewApiKey]:
-    return Call("POST", "/keys", NewApiKey.from_api, body={"name": name})
+def create_key(name: str | None, *, detach: bool = False) -> Call[NewApiKey]:
+    body: dict[str, Any] = {"name": name}
+    # Sent only when asked for, so a plain create is the same request it always was.
+    if detach:
+        body["detach"] = True
+    return Call("POST", "/keys", NewApiKey.from_api, body=body)
 
 
 def revoke_key(key_id: str) -> Call[None]:

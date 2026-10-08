@@ -127,7 +127,10 @@ class SyncTransport:
                 attempt += 1
                 continue
 
-            _log_response(call, key, attempt, response.status_code, time.monotonic() - started)
+            request_id = response.headers.get("x-request-id")
+            _log_response(
+                call, key, attempt, response.status_code, time.monotonic() - started, request_id
+            )
             # Read once and pass to both: the decision to retry now depends on how long the
             # server asked for, not only on the status. See RetryPolicy.should_retry.
             retry_after = retry_after_seconds(response.headers)
@@ -139,7 +142,7 @@ class SyncTransport:
                 )
 
             delay = self._retry.delay(attempt, retry_after)
-            _log_retry(call, key, attempt, f"HTTP {response.status_code}", delay)
+            _log_retry(call, key, attempt, f"HTTP {response.status_code}", delay, request_id)
             time.sleep(delay)
             attempt += 1
 
@@ -184,7 +187,10 @@ class AsyncTransport:
                 attempt += 1
                 continue
 
-            _log_response(call, key, attempt, response.status_code, time.monotonic() - started)
+            request_id = response.headers.get("x-request-id")
+            _log_response(
+                call, key, attempt, response.status_code, time.monotonic() - started, request_id
+            )
             # Read once and pass to both, exactly as the sync transport does.
             retry_after = retry_after_seconds(response.headers)
             if response.status_code < 400 or not self._retry.should_retry(
@@ -195,7 +201,7 @@ class AsyncTransport:
                 )
 
             delay = self._retry.delay(attempt, retry_after)
-            _log_retry(call, key, attempt, f"HTTP {response.status_code}", delay)
+            _log_retry(call, key, attempt, f"HTTP {response.status_code}", delay, request_id)
             await asyncio.sleep(delay)
             attempt += 1
 
@@ -222,8 +228,16 @@ def _log_request(call: Call[Any], key: str | None, attempt: int) -> None:
 
 
 def _log_response(
-    call: Call[Any], key: str | None, attempt: int, status_code: int, elapsed: float
+    call: Call[Any],
+    key: str | None,
+    attempt: int,
+    status_code: int,
+    elapsed: float,
+    request_id: str | None,
 ) -> None:
+    """Carries the response's ``X-Request-Id``, so a log line can be quoted to support and found
+    in BeaconBox's own logs. It is a random value the server minted, not anything about the
+    request."""
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "response %s %d in %dms",
@@ -236,11 +250,19 @@ def _log_response(
                 status_code=status_code,
                 elapsed_ms=round(elapsed * 1000),
                 idempotency_key=key,
+                request_id=request_id,
             ),
         )
 
 
-def _log_retry(call: Call[Any], key: str | None, attempt: int, reason: str, delay: float) -> None:
+def _log_retry(
+    call: Call[Any],
+    key: str | None,
+    attempt: int,
+    reason: str,
+    delay: float,
+    request_id: str | None = None,
+) -> None:
     """A warning rather than a debug: a retry means something went wrong, and it is the signal that
     explains why a merchant's job took four seconds instead of one.
 
@@ -259,6 +281,7 @@ def _log_retry(call: Call[Any], key: str | None, attempt: int, reason: str, dela
             reason=reason,
             retry_in_ms=round(delay * 1000),
             idempotency_key=key,
+            request_id=request_id,
         ),
     )
 

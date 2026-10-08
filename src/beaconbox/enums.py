@@ -17,11 +17,14 @@ from typing import Any, TypeVar
 __all__ = [
     "Channel",
     "ChannelSendStatus",
+    "EmailFailureReason",
     "EmailSkipReason",
     "MessageKind",
     "MessageStatus",
+    "OrderStatus",
     "RecipientStatus",
     "SkipReason",
+    "SmsConsentSource",
     "WebhookEventType",
     "WhatsAppReplyForward",
     "coerce",
@@ -36,6 +39,27 @@ class MessageKind(str, Enum):
 
     UPDATEABLE = "updateable"
     """Matched on subject. Creates and nudges the first time, then updates in place quietly."""
+
+
+class OrderStatus(str, Enum):
+    """What happened to the order a push is about: the value of a push's ``order_status``.
+
+    BeaconBox picks the platform-written WhatsApp and SMS wording from it, for example "Your order
+    #A-10294 from PhonicBloom has shipped." A WhatsApp nudge is sent only when the push carries
+    both ``reference`` and ``order_status``; otherwise WhatsApp is skipped with
+    ``template_not_sendable`` and nothing is charged.
+
+    The list grows on the server, so a push accepts a plain string as well, and a result carrying
+    a value this SDK does not know reads it back as that string.
+    """
+
+    CONFIRMED = "confirmed"
+    SHIPPED = "shipped"
+    READY_FOR_PICKUP = "ready_for_pickup"
+    DELIVERED = "delivered"
+    CANCELLED = "cancelled"
+    REFUNDED = "refunded"
+    DELAYED = "delayed"
 
 
 class MessageStatus(str, Enum):
@@ -53,6 +77,11 @@ class Channel(str, Enum):
 
     ``EMAIL`` is implicit and always sent, because it carries the inbox link. Listing it is
     allowed and harmless.
+
+    Naming ``SMS`` or ``WHATSAPP`` in a push's ``channels`` is a request that can only narrow
+    what your account settings allow, never switch a channel on. A channel whose mode is ``off``
+    stays off, and one BeaconBox has not yet enabled for your business never sends. A channel in
+    ``on_request`` mode sends only on a push that names it.
     """
 
     EMAIL = "email"
@@ -92,6 +121,23 @@ class RecipientStatus(str, Enum):
     STOPPED = "stopped"
 
 
+class SmsConsentSource(str, Enum):
+    """The surface a recipient's number was first accepted for texting through.
+
+    Recorded once, when texting first began, and never overwritten: a later number change, a STOP
+    and a START all leave it as the evidence of how it started.
+    """
+
+    PUSH = "push"
+    """A ``recipient_phone`` on a push."""
+    API = "api"
+    """:meth:`~beaconbox.resources.Recipients.set_phone`."""
+    ADMIN = "admin"
+    """A signed-in person on the recipient page in the dashboard."""
+    INBOX = "inbox"
+    """The recipient adding their own number in their inbox."""
+
+
 class WhatsAppReplyForward(str, Enum):
     """How much of a customer's WhatsApp reply your notification email carries."""
 
@@ -122,6 +168,15 @@ class WebhookEventType(str, Enum):
     MESSAGE_OPENED = "message.opened"
     MESSAGE_BOUNCED = "message.bounced"
     MESSAGE_FAILED = "message.failed"
+    """An email was attempted and will never be delivered.
+
+    ``data`` carries ``message_id``, ``recipient_email``, ``subject`` and ``channel``
+    (``"email"``), plus ``reason`` when BeaconBox gave up on the send itself: ``esp_refused`` (the
+    email provider rejected it outright), ``retries_exhausted`` (every attempt failed) or
+    ``outcome_unknown`` (the provider may have taken it and the answer was lost, so it may still
+    arrive). See :class:`EmailFailureReason`. The same outcome reads back as ``delivery.failed``
+    on the message, so a caller polling for delivery can stop waiting, except on
+    ``outcome_unknown``: a later ``message.delivered`` clears that one."""
     MESSAGE_COMPLAINED = "message.complained"
     MESSAGE_NOT_SENT = "message.not_sent"
     """No email was ever attempted, and ``data["reason"]`` says why.
@@ -130,10 +185,32 @@ class WebhookEventType(str, Enum):
     in would put a refusal into the rate you watch for provider trouble."""
     SMS_DELIVERED = "sms.delivered"
     SMS_FAILED = "sms.failed"
+    """A text did not reach the handset. ``data`` carries ``message_id``, ``recipient_phone``
+    (masked), ``country_code``, ``credits_charged``, ``channel`` (``"sms"``) and ``error_code``.
+
+    ``error_code`` ``sms.submit_outcome_unknown`` means BeaconBox called the carrier and never
+    learned the answer. No second copy is sent, because the first may already have gone, and the
+    charge stands for the same reason: the recipient may still have received it.
+
+    Sent on the carrier's receipt, and also when BeaconBox ends the send itself: an outcome it
+    never learned, or a send given up on after its retries."""
     SMS_REJECTED = "sms.rejected"
+    """The text was refused, by the carrier's receipt or at submit."""
     WHATSAPP_DELIVERED = "whatsapp.delivered"
     WHATSAPP_FAILED = "whatsapp.failed"
+    """A WhatsApp message did not reach the handset. ``data`` has the same fields as
+    :attr:`SMS_FAILED`, with ``channel`` ``"whatsapp"``.
+
+    ``error_code`` ``whatsapp.submit_outcome_unknown`` means BeaconBox called Meta and never
+    learned the answer, and no status arrived for it within five minutes. It is not resent and
+    the charge stands, as for SMS; ``sms_if_whatsapp_fails`` still texts them.
+
+    Sent on Meta's status, and also when BeaconBox ends the send itself: an outcome it never
+    learned, or a send given up on after its retries."""
     WHATSAPP_REJECTED = "whatsapp.rejected"
+    """The WhatsApp message was refused, by Meta's status or at submit. Also sent, with
+    ``error_code`` ``whatsapp.submit_refused`` and the credit refunded, for a send Meta refused on
+    every attempt until BeaconBox gave up."""
     WHATSAPP_READ = "whatsapp.read"
     WHATSAPP_INBOUND_MESSAGE = "whatsapp.inbound_message"
     CREDITS_LOW_BALANCE = "credits.low_balance"
@@ -143,7 +220,8 @@ class WebhookEventType(str, Enum):
     """**Email sending has stopped.** The one to alert on: every nudge from here produces a
     :attr:`MESSAGE_NOT_SENT` with reason ``plan_lapsed`` until the subscription is paid."""
     PLAN_ALLOWANCE_EXCEEDED = "plan.allowance_exceeded"
-    """The period's included email is used up. Nothing stops — it is billable from here."""
+    """The period's included email is used up. Sending continues and nothing is charged for it:
+    the allowance is fair use."""
 
 
 class EmailSkipReason(str, Enum):
@@ -159,8 +237,9 @@ class EmailSkipReason(str, Enum):
                 ...
 
     The three worth branching on are :attr:`PLAN_LAPSED` (pay, and sending resumes),
-    :attr:`DAILY_CAP_REACHED` (nothing is wrong; the day's allowance ran out) and
-    :attr:`SUPPRESSED` (that address will never be emailed again for you).
+    :attr:`DAILY_CAP_REACHED` (nothing is wrong; the day's allowance ran out, and the update needs
+    pushing again because it is not retried) and :attr:`SUPPRESSED` (that address will never be
+    emailed again for you).
     """
 
     PLAN_LAPSED = "plan_lapsed"
@@ -168,8 +247,13 @@ class EmailSkipReason(str, Enum):
     re-pushed for new messages."""
     DAILY_CAP_REACHED = "daily_cap_reached"
     """The sending domain's daily cap. Nothing is wrong with the account, and later messages the
-    same day are refused too."""
+    same day are refused too.
+
+    **Requires a resend.** This decision is final for the send: the nudge is not retried when the
+    cap resets, so push again the next day if the update still matters."""
     SENDING_PAUSED = "sending_paused"
+    BUSINESS_INACTIVE = "business_inactive"
+    """Your business has been deactivated, so nothing is sent for it."""
     SUPPRESSED = "suppressed"
     """This address hard-bounced or complained for you. It is never emailed for you again."""
     PLATFORM_SUPPRESSED = "platform_suppressed"
@@ -178,6 +262,29 @@ class EmailSkipReason(str, Enum):
     MESSAGE_RETRACTED = "message_retracted"
     MESSAGE_OBSOLETE = "message_obsolete"
     """A newer message replaced this one before its nudge ran."""
+
+
+class EmailFailureReason(str, Enum):
+    """Why BeaconBox gave up on an attempted email: the values ``delivery.failed.reason`` and the
+    ``message.failed`` webhook carry.
+
+    The counterpart of :class:`EmailSkipReason` at the other end of the send path. That one means
+    BeaconBox decided not to try; this one means it tried and the send was refused, never
+    succeeded, or ended without an answer (:attr:`OUTCOME_UNKNOWN`). Like that enum it is **not
+    the parsed type** of the field: compare against it and treat anything else as "failed",
+    because the list grows.
+    """
+
+    ESP_REFUSED = "esp_refused"
+    """The email provider rejected the message outright."""
+    RETRIES_EXHAUSTED = "retries_exhausted"
+    """Every attempt failed and BeaconBox stopped trying."""
+    OUTCOME_UNKNOWN = "outcome_unknown"
+    """The email provider accepted the message, or may have, but its answer was lost. Reported as
+    failed so nothing waits on it forever, and never sent again, because a second email would be
+    a second live sign-in link. **It may still arrive**: a later delivery from the provider
+    clears ``delivery.failed`` (back to ``None``) and shows as delivered, whatever its
+    timestamp."""
 
 
 class SkipReason(str, Enum):
@@ -195,6 +302,8 @@ class SkipReason(str, Enum):
     * :attr:`NO_PHONE` and :attr:`PHONE_CONFLICT` are data problems on your side.
     * :attr:`STOPPED`, :attr:`UNSUBSCRIBED` and :attr:`NOT_OPTED_IN` are the recipient's choice.
       Do not route around them.
+    * :attr:`SMS_NOT_ENABLED` and :attr:`WHATSAPP_NOT_ENABLED` mean BeaconBox has not switched
+      that channel on for your business yet. Ask for it from the dashboard.
     * The rest are account or destination settings.
 
     Values not listed here can appear: compare as a string and see
@@ -205,8 +314,19 @@ class SkipReason(str, Enum):
     UNSUBSCRIBED = "unsubscribed"
     DISABLED_BY_REQUEST = "disabled_by_request"
     """Your own ``channels`` argument left this channel out."""
+    SMS_NOT_ENABLED = "sms_not_enabled"
+    """SMS has not been enabled for your business yet. Naming ``sms`` in ``channels`` does not
+    change that."""
     SMS_DISABLED = "sms_disabled"
+    """Your SMS mode is ``off``. Final: naming ``sms`` in ``channels`` does not override it."""
+    SMS_WARMUP_CAP_REACHED = "sms_warmup_cap_reached"
+    """A newly enabled business sends a limited number of texts a day while it warms up. Decided
+    when the send runs, so it reaches you on the message's ``delivery.sms`` rather than in the
+    push response."""
+    WHATSAPP_NOT_ENABLED = "whatsapp_not_enabled"
+    """WhatsApp has not been enabled for your business yet."""
     WHATSAPP_DISABLED = "whatsapp_disabled"
+    """Your WhatsApp mode is ``off``. Final, like :attr:`SMS_DISABLED`."""
     COUNTRY_NOT_ALLOWED = "country_not_allowed"
     NO_PHONE = "no_phone"
     PHONE_CONFLICT = "phone_conflict"

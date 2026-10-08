@@ -11,7 +11,7 @@ from datetime import datetime
 
 from . import _ops
 from ._transport import SyncTransport
-from .enums import Channel, MessageKind, WebhookEventType
+from .enums import Channel, MessageKind, OrderStatus, WebhookEventType
 from .errors import BeaconBoxError
 from .models import (
     ApiKey,
@@ -23,6 +23,7 @@ from .models import (
     MessagePushResult,
     NewApiKey,
     NewWebhookEndpoint,
+    RecipientErasureReport,
     RecipientSms,
     RetractResult,
     SmsOutcome,
@@ -110,6 +111,7 @@ class Messages(_Resource):
         body: str,
         kind: MessageKind | str = MessageKind.ONE_OFF,
         reference: str | None = None,
+        order_status: OrderStatus | str | None = None,
         recipient_phone: str | None = None,
         channels: Sequence[Channel | str] | None = None,
         notify: bool | None = None,
@@ -133,16 +135,38 @@ class Messages(_Resource):
             ``updateable`` creates and nudges the first time, then updates in place quietly, which
             is what you want for a shipping estimate that moves twice before the parcel arrives.
         :param reference: Your own order number, for example ``#A-10294``. Letters, digits and
-            ``# - _ . /`` only, no spaces, at most 32 characters. It appears in the WhatsApp nudge,
-            which Meta reviews, so it has to be an identifier rather than a sentence.
+            ``# - _ . /`` only, no spaces, at most 32 characters. It appears in the WhatsApp and
+            the SMS nudge, so it has to be an identifier rather than a sentence, and a nudge shows
+            it only when it passes a stricter display rule: an optional leading ``#``, then a
+            letter or digit, then letters, digits and ``_ / # -``, with at most two dots, each
+            directly before a digit (``INV.2026`` is shown, ``shop.com`` is not). A reference
+            that fails the rule is stored and echoed but never shown, and such a push sends no
+            WhatsApp message.
+        :param order_status: What happened to the order, as an
+            :class:`~beaconbox.enums.OrderStatus` or its string value (``"shipped"``, say). A
+            plain string is sent as given, so a status the API adds later works before this SDK
+            knows it. BeaconBox picks the platform-written WhatsApp and SMS wording from it, for
+            example "Your order #A-10294 from PhonicBloom has shipped." **A WhatsApp nudge needs
+            both** ``reference`` **and** ``order_status``: missing either, WhatsApp is skipped with
+            ``template_not_sendable`` and nothing is charged. An in-place update replaces it, as it
+            does ``reference``, so an update without it clears it.
         :param recipient_phone: Mobile number for the SMS nudge, E.164 preferred. Stored against
             this recipient for your business and reused on later pushes, so it is optional once
-            you have sent it once.
-        :param channels: Override your account's channel settings for this one request. Unset
-            follows the account defaults. Listing both ``sms`` and ``whatsapp`` sends two messages
-            and costs two credits. Email is always sent regardless. An explicit request overrides
-            your account default only: it never overrides a country restriction, a recipient who
-            opted out, or a recipient who never opted in to WhatsApp.
+            you have sent it once. A number that cannot be parsed, or cannot be a recipient's phone
+            (premium-rate, toll-free, shared-cost, voicemail, service, or a satellite or
+            international code such as +881), refuses the whole push with
+            :class:`~beaconbox.errors.InvalidRequestError` (``sms.phone_invalid``) before anything
+            is written, so you can correct it and retry with the same key.
+        :param channels: Which paid channels this push asks for. **A request that can only
+            narrow, never switch a channel on.** Unset follows your account settings. Leaving a
+            channel out of the list suppresses it for this push. Naming one sends on it only where
+            your settings already allow it: a channel in ``off`` mode stays off (``sms_disabled``,
+            ``whatsapp_disabled``), one BeaconBox has not yet enabled for your business never
+            sends (``sms_not_enabled``, ``whatsapp_not_enabled``), and one in ``on_request`` mode
+            sends only on a push that names it. Naming a channel never overrides a country
+            restriction, a recipient who opted out, or a recipient who never opted in to WhatsApp.
+            Listing both ``sms`` and ``whatsapp`` sends two messages and costs two credits. Email
+            is always sent regardless.
         :param notify: Unset applies the default (create nudges, in-place update stays silent).
             ``True`` forces a nudge on an update, ``False`` suppresses one even on first create.
         :param send_at: Hold the *nudge* until this moment. **Timezone required**, and a naive
@@ -155,19 +179,32 @@ class Messages(_Resource):
             message after this many minutes (5 to 10080). If they open it first, nothing is sent
             and nothing is charged. That inverts what a paid channel usually costs you: instead of
             paying to interrupt everybody, you pay only for the people the email did not reach.
+            The minutes count from the email: from ``send_at`` when you set one, otherwise from
+            the push, and if the email is still queued at the deadline it moves to this many
+            minutes after the email goes. An email that bounced, failed or was skipped (a
+            suppressed address, say) counts as unread, so the paid channel is still sent, subject
+            to its own consent and settings: that is the case the paid channel exists for. Only a
+            push that queued no nudge at all never escalates. A channel in ``on_request`` mode that
+            this push named still sends at the deadline.
         :param obsoletes: Ids of your earlier messages to grey out, for when this update replaces
-            them.
+            them. At most 100 ids of at most 64 characters each; more is refused with
+            :class:`~beaconbox.errors.InvalidRequestError`.
         :param whatsapp_opt_in_source: Record that this recipient agreed to be messaged on
             WhatsApp, naming the surface where they agreed in your own words, for example
             ``"checkout tickbox"``. This is the audit answer to "prove they agreed", so it must
             name a real surface of yours. Recording consent is not sending, so it works while your
             WhatsApp channel is still off. Consent is per business and reaches no other merchant.
         :param sms_if_whatsapp_fails: Text this recipient if the WhatsApp nudge proves
-            *undeliverable* — Meta refuses it (usually because the number is not on WhatsApp), the
+            *undeliverable*: Meta refuses it (usually because the number is not on WhatsApp), the
             delivery status comes back failed, or no status arrives within five minutes. It does
             **not** fire for a message that was delivered and not read: someone who read it on
             another device would get the same update twice. The SMS costs its own credit and
-            appears as its own send. Ignored unless a WhatsApp message was actually queued.
+            appears as its own send. It also texts at once when WhatsApp cannot carry the message
+            at all: the number is already known not to be on WhatsApp (``not_reachable``), or
+            there is no template for it (``template_not_sendable`` because the push lacks
+            ``reference`` or ``order_status``, or the reference or your business name cannot be
+            shown); not while a template is still in review at Meta. Otherwise ignored unless a
+            WhatsApp message was actually queued. At most one text either way.
         :param idempotency_key: See below. Generated when omitted.
 
         **Idempotency.** Every write carries an ``Idempotency-Key``. This SDK generates one per
@@ -180,6 +217,11 @@ class Messages(_Resource):
         :returns: A :class:`~beaconbox.models.MessagePushResult`. Check ``result.sms`` and
             ``result.whatsapp`` for what the paid channels did.
 
+        A request body over 2 MiB is refused with :class:`~beaconbox.errors.InvalidRequestError`
+        (HTTP 413, ``request.too_large``), and text containing a NUL character or a lone surrogate
+        with ``request.unstorable_input`` (422). Neither is retried: the same body is refused
+        again.
+
         .. code-block:: python
 
             result = client.messages.push(
@@ -187,6 +229,8 @@ class Messages(_Resource):
                 subject="Your order has shipped",
                 body="Tracking XY123456789EE. Estimated delivery Thursday.",
                 kind="updateable",
+                reference="#A-10294",
+                order_status=OrderStatus.SHIPPED,
                 channels=["sms"],
                 recipient_phone="+37255550134",
                 idempotency_key="order-4711-shipped",
@@ -195,6 +239,18 @@ class Messages(_Resource):
             if result.sms and result.sms.skipped_reason == SkipReason.INSUFFICIENT_CREDIT:
                 # Top up, then: client.messages.resend_sms(result.id)
                 ...
+
+        Naming a channel cannot switch it on. On an account whose SMS mode is ``off``, or where
+        BeaconBox has not enabled SMS yet, the push above still succeeds and reports why no text
+        went out:
+
+        .. code-block:: python
+
+            if result.sms and result.sms.skipped_reason in (
+                SkipReason.SMS_DISABLED,
+                SkipReason.SMS_NOT_ENABLED,
+            ):
+                ...  # the email went; turn SMS on in the dashboard to text as well
         """
         message = MessagePush(
             recipient_email=recipient_email,
@@ -202,6 +258,7 @@ class Messages(_Resource):
             body=body,
             kind=kind,
             reference=reference,
+            order_status=order_status,
             recipient_phone=recipient_phone,
             channels=tuple(channels) if channels is not None else None,
             notify=notify,
@@ -221,12 +278,29 @@ class Messages(_Resource):
         A list of complete, individual pushes, not one message fanned out to many recipients:
         fifty orders means fifty tracking numbers.
 
-        **Always answers 200. Read** :attr:`~beaconbox.models.BatchResult.failed` **, not the
-        status code.** One rejected item does not fail the batch, because a batch that aborted at
-        item 7 would leave items 8 onwards unsent with nothing to say which.
+        **Answers 200 whenever the batch is processed. Read**
+        :attr:`~beaconbox.models.BatchResult.failed` **, not the status code.** One rejected item
+        does not fail the batch, because a batch that aborted at item 7 would leave items 8 onwards
+        unsent with nothing to say which.
+
+        **The one whole-batch refusal is a 409**, raised as :class:`~beaconbox.errors.ConflictError`
+        with ``error_code`` ``idempotency.request_in_progress``: another request with the same key
+        is still running this batch, or took it over while this one ran. It is never an item's
+        result, and the SDK does not retry it. Wait a few seconds and retry the whole batch with the
+        same key: items already sent are replayed, and every item's real outcome comes back.
 
         **Safe to retry with the same key.** Items that already went out are replayed rather than
-        sent a second time, including after a crash partway through the batch.
+        sent a second time, including after a crash partway through the batch. Each item's own key
+        is derived from the batch key by appending ``#<index>``, so a batch ``idempotency_key`` is
+        limited to 252 characters rather than 255; a longer one is refused with
+        :class:`~beaconbox.errors.InvalidRequestError` before anything runs.
+
+        Each item's ``channels`` follows the same rule as :meth:`push`: it can only narrow what
+        your account settings allow, never switch a channel on.
+
+        The whole request body may be at most 8 MiB. A larger one is refused as a whole, before any
+        item runs, with :class:`~beaconbox.errors.InvalidRequestError` (HTTP 413,
+        ``request.too_large``): split it into smaller batches.
 
         .. code-block:: python
 
@@ -296,9 +370,15 @@ class Messages(_Resource):
         The recovery path for a ``skipped_reason``, most often an empty balance that has since
         been topped up.
 
-        Refused with :class:`~beaconbox.errors.ConflictError` if one is already queued or
-        delivered. The only thing a second send would add is a second charge and a second
-        interruption.
+        Refused with :class:`~beaconbox.errors.ConflictError` (``sms.already_sent``) while one is
+        still queued for sending, or after one was accepted or delivered. The only thing a second
+        send would add is a second charge and a second interruption. The refusal is decided before
+        anything is written, so the idempotency key stays unspent.
+
+        A policy refusal is not an error: it comes back as the outcome's ``skipped_reason``, which
+        is ``None`` when the text was queued. Reaching this method counts as naming the channel,
+        so an ``on_request`` account sends; an ``off`` one, or one BeaconBox has not enabled for
+        SMS, still does not.
         """
         return self._transport.invoke(_ops.resend_sms(public_id), idempotency_key)
 
@@ -309,6 +389,11 @@ class Messages(_Resource):
 
         A separate call rather than a channel parameter, because a request naming both channels
         would have to mean charging twice and interrupting twice for one update.
+
+        Refused with :class:`~beaconbox.errors.ConflictError` as ``whatsapp.already_sent`` while a
+        WhatsApp send is still queued or after one was delivered or read, and as
+        ``whatsapp.escalated_to_sms`` when ``sms_if_whatsapp_fails`` has already texted them.
+        ``skipped_reason`` on the outcome is ``None`` when the message was queued.
         """
         return self._transport.invoke(_ops.resend_whatsapp(public_id), idempotency_key)
 
@@ -341,6 +426,9 @@ class Credits(_Resource):
 class Recipients(_Resource):
     """A recipient's contact details, and their right to be forgotten.
 
+    Two erasures, of different reach. :meth:`erase` is the whole Article 17 request for your
+    business; :meth:`erase_whatsapp` removes only their WhatsApp history.
+
     Reads return a **masked** number. An API key that leaks should not be usable to dump a phone
     book.
     """
@@ -355,6 +443,12 @@ class Recipients(_Resource):
         Unlike a push, this one fails loudly: storing the number is the entire request, so an
         unparseable number raises :class:`~beaconbox.errors.InvalidRequestError` and a clash with
         another of your recipients raises :class:`~beaconbox.errors.ConflictError`.
+
+        A number that cannot be a recipient's phone is refused the same way (``sms.phone_invalid``):
+        premium-rate, toll-free, shared-cost, voicemail and service numbers, and the satellite and
+        international codes that belong to no country (+800, +808, +870, +878, +881, +882, +883,
+        +888, +979). A number in those ranges stored before they were refused stays stored, and a
+        push skips SMS to it as ``country_not_allowed``.
         """
         return self._transport.invoke(_ops.set_recipient_phone(email, phone))
 
@@ -376,8 +470,51 @@ class Recipients(_Resource):
         **in the receipt.** It counts erased replies whose words may already be sitting in *your*
         mailboxes, which nothing here can reach. That number is your remaining work, and until you
         act on it the erasure is only ours.
+
+        ``email`` must be an email address. A blank value or one that is not an address raises
+        :class:`ValueError` before anything is sent (the API would answer 422).
         """
         return self._transport.invoke(_ops.erase_whatsapp(email), idempotency_key)
+
+    def erase(self, email: str, idempotency_key: str | None = None) -> RecipientErasureReport:
+        """Erase everything held about this recipient for your business. **Not undoable.**
+
+        The API half of an Article 17 request made to you. **Deleted:** the messages you sent them
+        (subjects and bodies), their delivery and open events, their SMS and WhatsApp send records
+        with the number each went to, the links that opened those messages, their WhatsApp
+        replies, and their recipient record (phone number, SMS and WhatsApp consent, unsubscribe
+        state). The copies inside webhook deliveries still queued for your endpoint and inside
+        stored API responses are scrubbed, and sends still waiting to go out are cancelled. Your
+        audit log keeps its entries with the address replaced by a keyed hash.
+
+        **Retained, on purpose:** email suppressions for the address (hard bounces, complaints,
+        and an unsubscribe, which is kept as a suppression) and SMS or WhatsApp opt-outs for their
+        number. They are what stop this person being contacted again by a later push, and an
+        opt-out erased on request stops being one. **Erasing does not undo an unsubscribe:** a
+        later push to the address finds them still unsubscribed. The report counts
+        both (:attr:`~beaconbox.models.RecipientErasureReport.suppressions_kept`,
+        :attr:`~beaconbox.models.RecipientErasureReport.stops_kept`). Other businesses' records
+        about the same person are untouched.
+
+        **Copies that already left BeaconBox are yours to erase:** webhook deliveries your endpoint
+        received, and the WhatsApp replies your forward email sent to your mailboxes, counted in
+        :attr:`~beaconbox.models.RecipientErasureReport.replies_a_forward_email_may_have_carried`.
+
+        It is a ``POST`` and carries an ``Idempotency-Key`` like every other. A repeat erasure
+        truthfully reports zeros, so retrying a timed-out call with the **same** key is how you get
+        the original counts back. An address you never messaged also answers with zeros, so this
+        cannot be used to test whether an address is on your list.
+
+        ``email`` must be an email address. A blank value or one that is not an address raises
+        :class:`ValueError` before anything is sent (the API would answer 422), so a slip in the
+        value you pass fails at your line rather than as a server validation error.
+
+        .. code-block:: python
+
+            report = client.recipients.erase("buyer@example.com")
+            print(report.messages_deleted, report.suppressions_kept, report.stops_kept)
+        """
+        return self._transport.invoke(_ops.erase_recipient(email), idempotency_key)
 
 
 class Keys(_Resource):
@@ -391,20 +528,33 @@ class Keys(_Resource):
         """Your keys, masked. Useful for auditing what exists and revoking what should not."""
         return self._transport.invoke(_ops.list_keys())
 
-    def create(self, name: str | None = None, idempotency_key: str | None = None) -> NewApiKey:
+    def create(
+        self, name: str | None = None, idempotency_key: str | None = None, *, detach: bool = False
+    ) -> NewApiKey:
         """Mint a key. Name it after the service that will hold it, not the person creating it.
 
         The returned :attr:`~beaconbox.models.NewApiKey.key` is unrecoverable. Write it to a
         secret store before the process exits. Its ``repr`` is redacted so an incidental log line
         cannot leak it, so read the attribute explicitly.
+
+        **A key minted with a key is revoked with it**, and with any key above it, unless it was
+        minted with ``detach=True``. To rotate, pass ``detach=True``: the new key keeps working
+        after you revoke the key this client uses. Mint it, move your systems to it, then
+        :meth:`revoke` the old one. A leaked key can mint a detached key too, so after revoking one,
+        :meth:`list` the keys and revoke any whose ``minted_by`` is the leaked key's id.
+
+        Refused with :class:`~beaconbox.errors.PermissionDeniedError` (``plan.read_only``) while
+        your plan has lapsed: pay, and minting works again.
         """
-        return self._transport.invoke(_ops.create_key(name), idempotency_key)
+        return self._transport.invoke(_ops.create_key(name, detach=detach), idempotency_key)
 
     def revoke(self, key_id: str) -> None:
         """Revoke a key immediately. In-flight requests using it start failing with 401.
 
         Revoking the key the calling client is authenticated with is allowed, and is the correct
-        response to a leak even though the next call from this client will fail.
+        response to a leak even though the next call from this client will fail. Every key minted
+        with it (and not detached) is revoked too, and the keys those minted in turn. A detached key
+        it minted is not: find those by ``minted_by`` in :meth:`list`.
         """
         self._transport.invoke(_ops.revoke_key(key_id))
 
@@ -458,7 +608,9 @@ class WebhookEndpoints(_Resource):
         is signed exactly like a real delivery, so it also proves your signature verification.
 
         Never raises for a failure at *your* end: read
-        :attr:`~beaconbox.models.WebhookTestResult.delivered`. Testing does not affect the
+        :attr:`~beaconbox.models.WebhookTestResult.delivered`. Pressing it in a tight loop is
+        refused with :class:`~beaconbox.errors.RateLimitError` (``webhook.test_rate_limited``),
+        because each press is a request to your server. Testing does not affect the
         endpoint's health counters, so you can press it as often as you like while fixing a
         handler.
         """

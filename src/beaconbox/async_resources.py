@@ -18,7 +18,7 @@ from datetime import datetime
 
 from . import _ops
 from ._transport import AsyncTransport
-from .enums import Channel, MessageKind, WebhookEventType
+from .enums import Channel, MessageKind, OrderStatus, WebhookEventType
 from .models import (
     ApiKey,
     BatchResult,
@@ -29,6 +29,7 @@ from .models import (
     MessagePushResult,
     NewApiKey,
     NewWebhookEndpoint,
+    RecipientErasureReport,
     RecipientSms,
     RetractResult,
     SmsOutcome,
@@ -68,6 +69,7 @@ class AsyncMessages(_AsyncResource):
         body: str,
         kind: MessageKind | str = MessageKind.ONE_OFF,
         reference: str | None = None,
+        order_status: OrderStatus | str | None = None,
         recipient_phone: str | None = None,
         channels: Sequence[Channel | str] | None = None,
         notify: bool | None = None,
@@ -82,9 +84,10 @@ class AsyncMessages(_AsyncResource):
 
         Async form of :meth:`beaconbox.resources.Messages.push`, which documents every argument.
 
-        The two things to carry over: check ``result.sms`` and ``result.whatsapp`` rather than the
-        status code, and pass your own ``idempotency_key`` whenever you have a natural one, so a
-        retry from your queue collapses onto the same key.
+        The three things to carry over: check ``result.sms`` and ``result.whatsapp`` rather than
+        the status code; ``channels`` can only narrow what your account settings allow, never
+        switch a channel on; and pass your own ``idempotency_key`` whenever you have a natural one,
+        so a retry from your queue collapses onto the same key.
         """
         message = MessagePush(
             recipient_email=recipient_email,
@@ -92,6 +95,7 @@ class AsyncMessages(_AsyncResource):
             body=body,
             kind=kind,
             reference=reference,
+            order_status=order_status,
             recipient_phone=recipient_phone,
             channels=tuple(channels) if channels is not None else None,
             notify=notify,
@@ -106,9 +110,12 @@ class AsyncMessages(_AsyncResource):
     async def push_batch(
         self, messages: Sequence[MessagePush], idempotency_key: str | None = None
     ) -> BatchResult:
-        """Up to 100 pushes in one call. Always answers 200: read ``result.failed``.
+        """Up to 100 pushes in one call. Answers 200 when processed: read ``result.failed``.
 
-        See :meth:`beaconbox.resources.Messages.push_batch`.
+        A 409 ``idempotency.request_in_progress`` raises :class:`~beaconbox.errors.ConflictError`
+        for the whole batch, never for one item: the same key is still running it. Retry the whole
+        batch later with the same key. A batch ``idempotency_key`` is limited to 252 characters. See
+        :meth:`beaconbox.resources.Messages.push_batch`.
         """
         return await self._transport.invoke(
             _ops.push_batch([m.to_payload() for m in messages]), idempotency_key
@@ -152,13 +159,17 @@ class AsyncMessages(_AsyncResource):
                 return
 
     async def resend_sms(self, public_id: str, idempotency_key: str | None = None) -> SmsOutcome:
-        """Send the SMS for a message whose text never went out. Conflicts if one already went."""
+        """Send the SMS for a message whose text never went out.
+
+        Raises :class:`~beaconbox.errors.ConflictError` while one is still queued or after one went.
+        See :meth:`beaconbox.resources.Messages.resend_sms`.
+        """
         return await self._transport.invoke(_ops.resend_sms(public_id), idempotency_key)
 
     async def resend_whatsapp(
         self, public_id: str, idempotency_key: str | None = None
     ) -> WhatsAppOutcome:
-        """The same, on WhatsApp."""
+        """The same, on WhatsApp. See :meth:`beaconbox.resources.Messages.resend_whatsapp`."""
         return await self._transport.invoke(_ops.resend_whatsapp(public_id), idempotency_key)
 
     async def retract(self, public_id: str, idempotency_key: str | None = None) -> RetractResult:
@@ -188,7 +199,12 @@ class AsyncRecipients(_AsyncResource):
         return await self._transport.invoke(_ops.recipient_sms(email))
 
     async def set_phone(self, email: str, phone: str) -> RecipientSms:
-        """Store a number, normalised to E.164. Fails loudly on an unparseable one."""
+        """Store a number, normalised to E.164. Fails loudly on an unparseable one.
+
+        Premium-rate, toll-free, shared-cost, voicemail and service numbers, and satellite and
+        international codes, are refused too (``sms.phone_invalid``). See
+        :meth:`beaconbox.resources.Recipients.set_phone`.
+        """
         return await self._transport.invoke(_ops.set_recipient_phone(email, phone))
 
     async def clear_phone(self, email: str) -> RecipientSms:
@@ -201,9 +217,21 @@ class AsyncRecipients(_AsyncResource):
         """Erase this recipient's WhatsApp history for your business. **Not undoable.**
 
         Read ``replies_a_forward_email_may_have_carried`` in the receipt: it is the part of the
-        erasure only you can finish. See :meth:`beaconbox.resources.Recipients.erase_whatsapp`.
+        erasure only you can finish. A blank or non-address ``email`` raises :class:`ValueError`
+        before anything is sent. See :meth:`beaconbox.resources.Recipients.erase_whatsapp`.
         """
         return await self._transport.invoke(_ops.erase_whatsapp(email), idempotency_key)
+
+    async def erase(self, email: str, idempotency_key: str | None = None) -> RecipientErasureReport:
+        """Erase everything held about this recipient for your business. **Not undoable.**
+
+        Deletes their messages, events, send records, WhatsApp replies and recipient record, and
+        keeps only their email suppressions (an unsubscribe among them, which erasing does not
+        undo) and SMS or WhatsApp opt-outs, so they cannot be contacted again. A blank or
+        non-address ``email`` raises :class:`ValueError` before
+        anything is sent. See :meth:`beaconbox.resources.Recipients.erase` for the full list.
+        """
+        return await self._transport.invoke(_ops.erase_recipient(email), idempotency_key)
 
 
 class AsyncKeys(_AsyncResource):
@@ -214,10 +242,11 @@ class AsyncKeys(_AsyncResource):
         return await self._transport.invoke(_ops.list_keys())
 
     async def create(
-        self, name: str | None = None, idempotency_key: str | None = None
+        self, name: str | None = None, idempotency_key: str | None = None, *, detach: bool = False
     ) -> NewApiKey:
-        """Mint a key. The returned ``key`` is unrecoverable: store it before the process exits."""
-        return await self._transport.invoke(_ops.create_key(name), idempotency_key)
+        """Mint a key. The returned ``key`` is unrecoverable: store it before the process exits.
+        ``detach=True`` mints one that survives revoking this client's key, for rotation."""
+        return await self._transport.invoke(_ops.create_key(name, detach=detach), idempotency_key)
 
     async def revoke(self, key_id: str) -> None:
         """Revoke a key immediately."""
@@ -250,7 +279,7 @@ class AsyncWebhookEndpoints(_AsyncResource):
     async def test(self, public_id: str) -> WebhookTestResult:
         """Send one sample ``ping`` to this endpoint and report what came back.
 
-        See :meth:`beaconbox.resources.WebhookEndpointsResource.test` — same contract, awaited.
+        See :meth:`beaconbox.resources.WebhookEndpoints.test`, same contract, awaited.
         """
         return await self._transport.invoke(_ops.test_webhook_endpoint(public_id))
 

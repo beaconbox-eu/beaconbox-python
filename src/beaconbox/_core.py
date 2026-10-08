@@ -109,9 +109,9 @@ class Call(Generic[T]):
     def needs_idempotency(self) -> bool:
         """Send an ``Idempotency-Key`` on every ``POST``, which is a deliberate superset.
 
-        The API *requires* one on six operations, all of them POSTs that send a message or move
-        something a person can see: the push, the batch, the retract, both resends, and the
-        WhatsApp erasure. ``POST /keys``, ``POST /webhook-endpoints`` and that endpoint's
+        The API *requires* one on seven operations, all of them POSTs that send a message or move
+        something a person can see: the push, the batch, the retract, both resends, and both
+        erasures. ``POST /keys``, ``POST /webhook-endpoints`` and that endpoint's
         ``/test`` accept a request without one — creating a second key or a second endpoint is
         visible and undoable, so repeating it costs nobody a message or a credit.
 
@@ -217,8 +217,11 @@ class Core:
         detail = body.get("detail")
         summary = detail if isinstance(detail, str) else error_code or "request failed"
         request_id = _header(headers, "x-request-id")
+        # The request id goes in the message as well as on the attribute, because the message is
+        # what reaches a log line or a bug report, and it is the one value support can search for.
+        where = f"HTTP {status_code}, request {request_id}" if request_id else f"HTTP {status_code}"
         return error_class_for(status_code)(
-            f"BeaconBox: {summary} (HTTP {status_code})",
+            f"BeaconBox: {summary} ({where})",
             status_code=status_code,
             error_code=error_code,
             body=body,
@@ -334,3 +337,32 @@ def path_segment(value: str) -> str:
     segment they were substituted into and address a different endpoint.
     """
     return quote(value, safe="")
+
+
+def erasable_address(email: str) -> str:
+    """The address an erasure is for, trimmed, or a ``ValueError`` before anything is sent.
+
+    The API answers 422 for anything that is not an email address, so this costs nothing it
+    would not refuse anyway. It is here because an erasure is the one call where a slip should
+    fail as early and as plainly as possible: a blank or mangled value from a form or a CSV should
+    say so at the line that passed it, not as a validation error from the server.
+
+    Deliberately loose (something, ``@``, a dotted domain, no whitespace) so that no address the
+    server would accept is refused here. The server's check stays the authority.
+    """
+    cleaned = email.strip() if isinstance(email, str) else ""
+    local, at, domain = cleaned.rpartition("@")
+    if (
+        not at
+        or not local
+        or "." not in domain.strip(".")
+        or any(character.isspace() for character in cleaned)
+    ):
+        # The value is not quoted: it is whatever the caller had instead of an address (a name,
+        # a phone number), and this message ends up in a log.
+        problem = "is not an email address" if cleaned else "is blank"
+        raise ValueError(
+            f"BeaconBox: erasing a recipient needs their email address, and the value given "
+            f"{problem}. Nothing was sent."
+        )
+    return cleaned

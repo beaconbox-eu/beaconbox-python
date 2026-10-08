@@ -19,6 +19,7 @@ from beaconbox._core import (
 )
 from beaconbox._version import __version__
 from beaconbox.errors import (
+    APIError,
     AuthenticationError,
     ConflictError,
     InvalidRequestError,
@@ -274,6 +275,59 @@ class TestErrorMapping:
             core().interpret(Call("GET", "/x", noop), 500, {"X-Request-Id": "req_9"}, b"{}")
 
         assert caught.value.request_id == "req_9"
+
+    def test_the_request_id_is_in_the_message_too(self) -> None:
+        """The message is what reaches a log line or a bug report, so it carries the id support
+        asks for without anybody having to know the attribute exists."""
+        with pytest.raises(ConflictError) as caught:
+            core().interpret(
+                Call("POST", "/x", noop),
+                409,
+                {"x-request-id": "3f2a9c"},
+                b'{"error_code":"request.conflict"}',
+            )
+
+        assert "request 3f2a9c" in str(caught.value)
+        assert "HTTP 409" in str(caught.value)
+
+    def test_no_request_id_leaves_the_message_as_it_was(self) -> None:
+        with pytest.raises(ServerError) as caught:
+            core().interpret(Call("GET", "/x", noop), 500, {}, b"{}")
+
+        assert caught.value.request_id is None
+        assert str(caught.value).endswith("(HTTP 500)")
+
+    @pytest.mark.parametrize(
+        ("status", "code", "expected"),
+        [
+            (409, "request.conflict", ConflictError),
+            (409, "sms.already_sent", ConflictError),
+            (409, "whatsapp.already_sent", ConflictError),
+            (409, "sms.phone_already_in_use", ConflictError),
+            (429, "webhook.test_rate_limited", RateLimitError),
+            (422, "common.validation_failed", InvalidRequestError),
+            (413, "request.too_large", InvalidRequestError),
+            (422, "request.unstorable_input", InvalidRequestError),
+            (403, "plan.read_only", PermissionDeniedError),
+        ],
+    )
+    def test_the_codes_public_routes_answer_map_by_status(
+        self, status: int, code: str, expected: type[APIError]
+    ) -> None:
+        body = f'{{"error_code":"{code}"}}'.encode()
+        with pytest.raises(expected) as caught:
+            core().interpret(Call("POST", "/x", noop), status, {}, body)
+
+        assert caught.value.error_code == code
+
+    def test_a_413_from_a_proxy_is_still_an_invalid_request(self) -> None:
+        """A proxy in front of the API can refuse an oversized body before BeaconBox sees it, with
+        no JSON and so no ``error_code``. The status alone has to pick the class."""
+        with pytest.raises(InvalidRequestError) as caught:
+            core().interpret(Call("POST", "/x", noop), 413, {}, b"Request Entity Too Large")
+
+        assert caught.value.status_code == 413
+        assert caught.value.error_code is None
 
     def test_a_non_json_error_body_still_raises_the_right_class(self) -> None:
         """An HTML 502 from a proxy in front of the API must not become a JSON parse error."""

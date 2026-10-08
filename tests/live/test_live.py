@@ -268,8 +268,10 @@ class TestMessages:
         assert not_sent.at.tzinfo is not None
 
     def test_an_unknown_id_is_a_404(self, client: BeaconBox) -> None:
-        with pytest.raises(ResourceMissingError):
+        with pytest.raises(ResourceMissingError) as caught:
             client.messages.get("m_definitelynotreal")
+        # Every response carries one, and it is what support asks for.
+        assert caught.value.request_id
 
 
 class TestOtherResources:
@@ -289,6 +291,17 @@ class TestOtherResources:
 
         cleared = client.recipients.clear_phone(RECIPIENT)
         assert cleared.phone is None
+
+    def test_erasing_a_recipient_deletes_their_messages(self, client: BeaconBox) -> None:
+        """A throwaway address, so erasing it cannot disturb the seeded recipient."""
+        address = f"erase-{uuid.uuid4().hex[:10]}@example.com"
+        pushed = client.messages.push(recipient_email=address, subject="Erase me", body="Gone.")
+
+        report = client.recipients.erase(address)
+
+        assert report.messages_deleted >= 1
+        with pytest.raises(ResourceMissingError):
+            client.messages.get(pushed.id)
 
     def test_keys_create_list_revoke(self, client: BeaconBox) -> None:
         created = client.keys.create(f"sdk-live-{uuid.uuid4().hex[:6]}")
